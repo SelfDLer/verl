@@ -100,6 +100,9 @@ def qwen2_5_vl_dedup_image_tokens(prompt_ids: list[int], processor):
     <|vision_start|><|image_pad|><|vision_end|>
     ```
     """
+    prepare_prompt = getattr(processor, "prepare_rollout_prompt_ids", None)
+    if callable(prepare_prompt):
+        return prepare_prompt(prompt_ids)
     if (
         processor is not None
         and hasattr(processor, "image_processor")

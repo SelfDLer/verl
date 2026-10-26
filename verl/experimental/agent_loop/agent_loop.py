@@ -892,6 +892,17 @@ class AgentLoopWorker:
         images = multi_modal_data.get("images")
         videos = multi_modal_data.get("videos")
         audios = multi_modal_data.get("audios")
+        # Some processors can rebuild media tensors without decoding rollout tokens,
+        # which may have lost special image markers. Follow the optional processor
+        # hook pattern used by get_rope_index_kwargs below.
+        get_features = getattr(self.processor, "get_multi_modal_features", None)
+        if get_features is not None:
+            return get_features(
+                images=images,
+                videos=videos,
+                audio=audios,
+                mm_processor_kwargs=output.mm_processor_kwargs,
+            )
         # Collapse expanded vision placeholder runs back to a single placeholder
         # per media item before decoding, so the processor re-expands cleanly.
         # ``input_ids`` already contains fully expanded image/video pad tokens; if
