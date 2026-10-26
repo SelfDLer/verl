@@ -38,6 +38,12 @@ class FSDPTurboEngineWithLMHead(FSDPEngineWithLMHead):
             self._process_ulysses_config()
 
     def _build_module(self):
+        from verl.models.fsdp_turbo import get_model_adapter
+
+        self._model_adapter = get_model_adapter(self.model_config.hf_config.model_type)
+        return self._model_adapter.build_module(self, self._build_default_module)
+
+    def _build_default_module(self):
         # Do not let verl's Qwen VLM monkey patch slice the text model before
         # FSDP-Turbo's post-fusion model patch does the CP split.
         cp_size = self.ulysses_sequence_parallel_size
@@ -50,6 +56,8 @@ class FSDPTurboEngineWithLMHead(FSDPEngineWithLMHead):
     def _build_fsdp_module(self, module):
         from fsdp_turbo.fsdp_turbo import FSDPTurbo
 
+        self._model_adapter.prepare_fsdp(self, module)
+
         full_state = module.state_dict()
         module = FSDPTurbo(self.fsdp_turbo_config, module).model
         offload_policy = None
@@ -61,6 +69,10 @@ class FSDPTurboEngineWithLMHead(FSDPEngineWithLMHead):
         fsdp2_load_full_state_dict(module, full_state, None, offload_policy)
 
         return module
+
+    def get_per_tensor_param(self, *args, **kwargs):
+        weights, peft_config = super().get_per_tensor_param(*args, **kwargs)
+        return self._model_adapter.export_weights(weights), peft_config
 
     def _is_ulysses_enabled(self):
         return self._parallel_state.is_group_enable("ulysses")
