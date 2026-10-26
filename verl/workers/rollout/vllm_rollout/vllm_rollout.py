@@ -226,10 +226,17 @@ class ServerAdapter(BaseRollout):
         )
         start_time = time.time()
 
+        update_kwargs = {**kwargs, "use_shm": self.use_shm}
+        staging = self.config.checkpoint_engine.weight_update_staging
+        if staging is not None:
+            if staging not in ("cpu", "device"):
+                raise ValueError("checkpoint_engine.weight_update_staging must be 'cpu', 'device', or null")
+            update_kwargs["weight_update_staging"] = staging
+
         future = await self._execute_method(
             "update_weights_from_ipc",
             non_block=True,
-            kwargs={**kwargs, "use_shm": self.use_shm},
+            kwargs=update_kwargs,
         )
 
         bucket_size_mb = self.config.checkpoint_engine.update_weights_bucket_megabytes

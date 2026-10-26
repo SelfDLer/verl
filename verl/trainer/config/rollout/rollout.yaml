@@ -307,6 +307,10 @@ checkpoint_engine:
   # when using Tensor Parallelism (TP) >= 8.
   update_weights_bucket_megabytes: 2048
 
+  # vLLM complete-update staging: null (stream buckets), cpu, or device.
+  # CPU/device staging holds a full checkpoint per rollout worker.
+  weight_update_staging: null
+
   # Additional keyword arguments to pass to the checkpoint engine constructor
   engine_kwargs: {}
 
