@@ -49,6 +49,8 @@ def restore_fp32_checkpoint_tensors(module, checkpoint_path):
 
 class Step5ModelAdapter(ModelAdapter):
     def build_module(self, engine, default_builder):
+        if engine.engine_config.router_replay.mode not in ("disabled", "R3"):
+            raise ValueError("Step5 FSDP-Turbo supports router_replay modes disabled and R3")
         if engine.use_remove_padding or engine._is_ulysses_enabled():
             raise ValueError("Step5 requires use_remove_padding=False and Ulysses size 1")
         if engine.fsdp_turbo_config.distributed.expert_parallel_size != 1:
@@ -82,3 +84,28 @@ class Step5ModelAdapter(ModelAdapter):
         from verl.models.transformers.step5 import step5_hf_weight_name
 
         return ((step5_hf_weight_name(name), tensor) for name, tensor in weights)
+
+    def prepare_model_inputs(self, engine, micro_batch, model_inputs):
+        """Pad rollout routes exactly like tokens, without a next-token shift."""
+        if engine.engine_config.router_replay.mode == "disabled":
+            return model_inputs
+        routes = micro_batch.get("routed_experts")
+        if routes is None:
+            raise ValueError("Step5 R3 requires routed_experts; enable rollout.enable_rollout_routing_replay")
+        if routes.is_nested:
+            tokens = micro_batch["input_ids"]
+            if not tokens.is_nested or not torch.equal(routes.offsets(), tokens.offsets()):
+                raise ValueError("Step5 R3 routes and input_ids must have identical per-sample lengths")
+            batch_size, sequence_length = model_inputs["input_ids"].shape
+            routes = torch.nested.to_padded_tensor(
+                routes, padding=0, output_size=(batch_size, sequence_length, *routes.shape[2:])
+            )
+        model_inputs["routed_experts"] = routes
+        response_mask = micro_batch.get("response_mask")
+        if response_mask is not None:
+            # Synthetic padding samples have tokens but no policy loss or routes.
+            model_inputs["routing_replay_sample_mask"] = (
+                torch.stack([sample.bool().any() for sample in response_mask.unbind()])
+                if response_mask.is_nested else response_mask.bool().any(dim=-1)
+            )
+        return model_inputs

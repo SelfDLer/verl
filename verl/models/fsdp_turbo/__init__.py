@@ -34,6 +34,10 @@ class ModelAdapter:
         """Preserve the original lazy checkpoint iterator."""
         return weights
 
+    def prepare_model_inputs(self, engine, micro_batch, model_inputs):
+        """Attach optional model-specific inputs after the engine applies padding."""
+        return model_inputs
+
 
 _MODEL_ADAPTERS = {
     "step5_vl": "verl.models.fsdp_turbo.step5.Step5ModelAdapter",

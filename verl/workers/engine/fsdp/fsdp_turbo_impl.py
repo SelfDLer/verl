@@ -74,6 +74,11 @@ class FSDPTurboEngineWithLMHead(FSDPEngineWithLMHead):
         weights, peft_config = super().get_per_tensor_param(*args, **kwargs)
         return self._model_adapter.export_weights(weights), peft_config
 
+    def prepare_model_inputs(self, micro_batch):
+        model_inputs, output_args = super().prepare_model_inputs(micro_batch)
+        model_inputs = self._model_adapter.prepare_model_inputs(self, micro_batch, model_inputs)
+        return model_inputs, output_args
+
     def _is_ulysses_enabled(self):
         return self._parallel_state.is_group_enable("ulysses")
 
