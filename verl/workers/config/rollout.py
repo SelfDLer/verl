@@ -133,9 +133,6 @@ class CheckpointEngineConfig(BaseConfig):
     backend: Optional[str] = "naive"
     # Bucket size in MB to transfer multiple weights at one time
     update_weights_bucket_megabytes: int = 2048
-    # vLLM loaders requiring a complete update may stage buckets on cpu/device.
-    # None preserves streaming bucket-wise loading.
-    weight_update_staging: Optional[str] = None
     # Additional keyword arguments for checkpoint engine
     engine_kwargs: dict = field(default_factory=dict)
     # If set, this Python module is imported on every worker process before the

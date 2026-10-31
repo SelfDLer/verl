@@ -258,13 +258,7 @@ class vLLMColocateWorkerExtension:
             # patch weight loader to support MoE model
             patch_vllm_moe_model_weight_loader(model)
 
-    def update_weights_from_ipc(
-        self,
-        peft_config: dict = None,
-        base_sync_done=False,
-        use_shm: bool = False,
-        weight_update_staging: str | None = None,
-    ):
+    def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
         """Update the weights of the rollout model."""
         if self.device is None:
             # vLLM workers may leave self.device unset on non-CUDA platforms (e.g. NPU);
@@ -315,34 +309,15 @@ class vLLMColocateWorkerExtension:
         # =========================== step 2: receive weights and update ===========================
         receiver = BucketedWeightReceiver(
             zmq_handle=self._get_zmq_handle(),
-            device=(
-                torch.device("cpu")
-                if use_shm and weight_update_staging == "cpu" and not (peft_config and base_sync_done)
-                else self.device
-            ),
+            device=self.device,
             use_shm=use_shm,
         )
         # LoRA adapters need a single complete tensor dict per ``add_lora``, but
         # the bucketed transport may split one across buckets. Accumulate and
         # apply only after ``is_last``; standard base weights load per bucket.
         lora_weights: dict[str, torch.Tensor] | None = {} if (peft_config and base_sync_done) else None
-        from verl.workers.rollout.vllm_rollout.weight_update_buffer import WeightUpdateBuffer
-
-        # Opt-in for loaders requiring a complete tensor set (e.g. fused projections).
-        # The default remains bucket-wise loading; LoRA keeps its existing path.
-        staging = weight_update_staging
-        full_update = WeightUpdateBuffer(staging) if staging is not None and lora_weights is None else None
 
         def on_bucket_received(weights: list[tuple[str, torch.Tensor]], is_last: bool) -> None:
-            if full_update is not None:
-                full_update.receive(
-                    weights,
-                    is_last,
-                    lambda complete: self._update_weights(
-                        complete, peft_config=peft_config, base_sync_done=base_sync_done
-                    ),
-                )
-                return
             if lora_weights is not None:
                 # Clone: add_lora keeps these past the callback (reused IPC buffer, #6454).
                 lora_weights.update((name, tensor.clone()) for name, tensor in weights)
@@ -361,11 +336,7 @@ class vLLMColocateWorkerExtension:
                 base_sync_done=base_sync_done,
             )
 
-        try:
-            receiver.receive_weights(on_bucket_received=on_bucket_received)
-        finally:
-            if full_update is not None:
-                full_update.clear()
+        receiver.receive_weights(on_bucket_received=on_bucket_received)
 
         # =========================== step 3: process weights after loading ===========================
         if self._is_qat_model:

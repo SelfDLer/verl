@@ -18,6 +18,7 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 import torch
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -298,3 +299,161 @@ def test_vllm_update_weights_syncs_buffers_to_mtp_drafter():
     expected = torch.tensor([5, 6, 7, 8], dtype=torch.float32)
     torch.testing.assert_close(main_model.model.layers[0].e_score_correction_bias, expected)
     torch.testing.assert_close(drafter_model.model.layers[0].e_score_correction_bias, expected)
+
+
+def _make_streaming_worker(monkeypatch, events, with_mtp=False):
+    """Exercise the real worker callback using CPU parameters and fake transport."""
+    main = _ToyModel()
+    main.model.layers.append(_ToyBlock())
+    models = [("main", main)]
+    spec_config = None
+    if with_mtp:
+        draft = _ToyModel()
+        draft.model.layers.append(_ToyBlock())
+        models.append(("draft", draft))
+        spec_config = types.SimpleNamespace(method="mtp", draft_model_config=object())
+
+    for label, model in models:
+
+        def load(weights, label=label, model=model):
+            params = dict(model.named_parameters())
+            for name, tensor in weights:
+                params[name].data.copy_(tensor)
+                events.append(("load", label, name))
+
+        model.load_weights = load
+
+    worker = object.__new__(vLLMColocateWorkerExtension)
+    worker.device = torch.device("cpu")
+    worker._is_qat_model = False
+    worker._is_modelopt_qat = False
+    worker._get_zmq_handle = lambda: "unused-cpu-test"
+    worker.model_runner = _FakeModelRunner(main, speculative_config=spec_config)
+    worker.model_runner.vllm_config.model_config = object()
+    if with_mtp:
+        worker.model_runner.drafter = types.SimpleNamespace(model=draft)
+
+    postprocess = types.ModuleType("vllm.model_executor.model_loader.utils")
+
+    def finish(model, config, device):
+        assert device == torch.device("cpu")
+        label = next(label for label, candidate in models if candidate is model)
+        events.append(("finish", label))
+
+    postprocess.process_weights_after_loading = finish
+    monkeypatch.setitem(sys.modules, postprocess.__name__, postprocess)
+    return worker, models, postprocess
+
+
+@pytest.mark.parametrize("with_mtp", [False, True])
+def test_ipc_loads_each_bucket_before_reuse_then_finalizes_once(monkeypatch, with_mtp):
+    events = []
+    worker, models, _ = _make_streaming_worker(monkeypatch, events, with_mtp)
+    labels = [label for label, _ in models]
+    expected_events = []
+
+    class Receiver:
+        def __init__(self, **kwargs):
+            assert kwargs == {"zmq_handle": "unused-cpu-test", "device": torch.device("cpu"), "use_shm": False}
+
+        def receive_weights(self, on_bucket_received):
+            bucket = torch.empty(4, 4)
+            for layer_index, value in enumerate((11.0, 22.0)):
+                name = f"model.layers.{layer_index}.linear.weight"
+                bucket.fill_(value)
+                on_bucket_received([(name, bucket)], is_last=layer_index == 1)
+                expected_events.extend(("load", label, name) for label in labels)
+                # The per-bucket callback must finish loading before transport
+                # overwrites its storage, without waiting for the final bucket.
+                assert events == expected_events
+                bucket.fill_(-999.0)
+                for _, model in models:
+                    torch.testing.assert_close(
+                        model.model.layers[layer_index].linear.weight,
+                        torch.full((4, 4), value),
+                    )
+            events.append(("receive_done",))
+            expected_events.append(("receive_done",))
+
+    monkeypatch.setattr(_vllm_rollout_utils, "BucketedWeightReceiver", Receiver)
+    worker.update_weights_from_ipc()
+
+    expected_events.extend(("finish", label) for label in labels)
+    assert events == expected_events
+
+
+@pytest.mark.parametrize("failure_stage", ["transport", "load", "finalize"])
+def test_ipc_failure_propagates_without_premature_finalization(monkeypatch, failure_stage):
+    events = []
+    worker, models, postprocess = _make_streaming_worker(monkeypatch, events)
+
+    if failure_stage == "load":
+
+        def fail_load(weights):
+            raise RuntimeError("load failed")
+
+        models[0][1].load_weights = fail_load
+    if failure_stage == "finalize":
+
+        def fail_finish(model, config, device):
+            events.append(("finish_failed",))
+            raise RuntimeError("finalize failed")
+
+        postprocess.process_weights_after_loading = fail_finish
+
+    class Receiver:
+        def __init__(self, **kwargs):
+            pass
+
+        def receive_weights(self, on_bucket_received):
+            on_bucket_received(
+                [("model.layers.0.linear.weight", torch.ones(4, 4))],
+                is_last=failure_stage != "transport",
+            )
+            if failure_stage == "transport":
+                raise RuntimeError("transport failed")
+            events.append(("receive_done",))
+
+    monkeypatch.setattr(_vllm_rollout_utils, "BucketedWeightReceiver", Receiver)
+    with pytest.raises(RuntimeError, match=f"{failure_stage} failed"):
+        worker.update_weights_from_ipc()
+
+    assert not any(event[0] == "finish" for event in events)
+    if failure_stage == "finalize":
+        assert events[-2:] == [("receive_done",), ("finish_failed",)]
+    else:
+        assert not any(event[0] == "receive_done" for event in events)
+
+
+def test_ipc_lora_keeps_complete_adapter_without_base_postprocessing(monkeypatch):
+    events = []
+    worker, _, _ = _make_streaming_worker(monkeypatch, events)
+    worker.remove_lora = lambda adapter_id: events.append(("remove_lora", adapter_id))
+    received = []
+
+    def update(weights, peft_config, base_sync_done):
+        assert peft_config == {"r": 4} and base_sync_done
+        received.extend((name, tensor.clone()) for name, tensor in weights)
+        events.append(("load_lora",))
+
+    worker._update_weights = update
+
+    class Receiver:
+        def __init__(self, **kwargs):
+            pass
+
+        def receive_weights(self, on_bucket_received):
+            bucket = torch.ones(4)
+            on_bucket_received([("adapter.a", bucket)], is_last=False)
+            assert not received
+            bucket.fill_(2.0)
+            on_bucket_received([("adapter.b", bucket)], is_last=True)
+            bucket.fill_(-999.0)
+
+    monkeypatch.setattr(_vllm_rollout_utils, "BucketedWeightReceiver", Receiver)
+    worker.update_weights_from_ipc(peft_config={"r": 4}, base_sync_done=True)
+
+    assert [name for name, _ in received] == ["adapter.a", "adapter.b"]
+    torch.testing.assert_close(received[0][1], torch.ones(4))
+    torch.testing.assert_close(received[1][1], torch.full((4,), 2.0))
+    assert [event[0] for event in events] == ["remove_lora", "load_lora"]
