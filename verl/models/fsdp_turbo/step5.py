@@ -53,8 +53,18 @@ class Step5ModelAdapter(ModelAdapter):
             raise ValueError("Step5 FSDP-Turbo supports router_replay modes disabled and R3")
         if engine.use_remove_padding or engine._is_ulysses_enabled():
             raise ValueError("Step5 requires use_remove_padding=False and Ulysses size 1")
-        if engine.fsdp_turbo_config.distributed.expert_parallel_size != 1:
-            raise ValueError("Step5 RL weight synchronization currently requires expert_parallel_size=1")
+        distributed = engine.fsdp_turbo_config.distributed
+        if distributed.expert_parallel_size > 1:
+            config = engine.model_config.hf_config
+            text_config = getattr(config, "text_config", config)
+            if text_config.moe_num_experts % distributed.expert_parallel_size:
+                raise ValueError("Step5 expert count must be divisible by expert_parallel_size")
+            if distributed.ep_plan.dispatcher not in (
+                "custom_native_eager_forward",
+                "custom_native_eager_fused_forward",
+                "custom_native_mc2_forward",
+            ):
+                raise ValueError("Step5 EP requires a Step5 native dispatcher to preserve FP32 combine")
 
         from fsdp_turbo.models.step5 import (
             Step5ForConditionalGeneration,
@@ -77,13 +87,30 @@ class Step5ModelAdapter(ModelAdapter):
     def prepare_fsdp(self, engine, module):
         from fsdp_turbo.models.step5 import configure_step5_fsdp_plan, prepare_step5_model_for_fsdp
 
-        prepare_step5_model_for_fsdp(module)
+        distributed = engine.fsdp_turbo_config.distributed
+        fuse_gate_up = distributed.expert_parallel_size > 1 and distributed.ep_plan.dispatcher in (
+            "custom_native_eager_fused_forward",
+            "custom_native_mc2_forward",
+        )
+        prepare_step5_model_for_fsdp(module, fuse_gate_up=fuse_gate_up)
         configure_step5_fsdp_plan(engine.fsdp_turbo_config.distributed.fsdp_plan)
 
     def export_weights(self, weights):
         from verl.models.transformers.step5 import step5_hf_weight_name
 
-        return ((step5_hf_weight_name(name), tensor) for name, tensor in weights)
+        # The engine materializes each DTensor with full_tensor() before this
+        # hook, gathering both the EP and E-FSDP dimensions. Restore the HF
+        # stacked layout after that collective, never split a local shard.
+        for name, tensor in weights:
+            if name.endswith(".moe.experts.gate_up_proj"):
+                if tensor.ndim != 3 or tensor.shape[1] % 2:
+                    raise ValueError(f"Invalid Step5 fused expert shape: {name} {tuple(tensor.shape)}")
+                gate, up = tensor.chunk(2, dim=1)
+                base = name.removesuffix(".gate_up_proj")
+                yield step5_hf_weight_name(f"{base}.gate_proj"), gate.contiguous()
+                yield step5_hf_weight_name(f"{base}.up_proj"), up.contiguous()
+            else:
+                yield step5_hf_weight_name(name), tensor
 
     def prepare_model_inputs(self, engine, micro_batch, model_inputs):
         """Pad rollout routes exactly like tokens, without a next-token shift."""
