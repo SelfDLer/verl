@@ -18,6 +18,7 @@ import torch
 from transformers import PretrainedConfig
 
 from verl.utils.device import get_torch_device
+from verl.utils.step5_flops import estimate_step5_flops
 
 _DEVICE_FLOPS = {
     "CPU": 448e9,
@@ -676,6 +677,8 @@ def _estimate_hy_v3_flops(config, tokens_sum, batch_seqlens, delta_time):
 
 
 ESTIMATE_FUNC = {
+    "step5": estimate_step5_flops,
+    "step5_vl": estimate_step5_flops,
     "qwen2": _estimate_qwen2_flops,
     "llama": _estimate_qwen2_flops,
     "qwen2_moe": _estimate_qwen2_moe_flops,

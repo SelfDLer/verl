@@ -43,6 +43,7 @@ from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.metric.utils import Metric
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage
 from verl.utils.py_functional import append_to_dict
+from verl.utils.step5_flops import step5_image_shapes
 from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
 from verl.utils.torch_functional import allgather_dict_into_dict
 from verl.workers.config import (
@@ -209,7 +210,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
         """
         self.engine.initialize()
 
-    def _postprocess_output(self, output, *, global_token_num, delta_time, forward_only, images_seqlens):
+    def _postprocess_output(
+        self, output, *, global_token_num, delta_time, forward_only, images_seqlens, step5_shapes=None
+    ):
         """
 
         Args:
@@ -259,7 +262,11 @@ class TrainingWorker(Worker, DistProfilerExtension):
         # compute mfu
         if global_token_num is not None and self.flops_counter is not None:
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(
-                global_token_num, delta_time, images_seqlens=images_seqlens
+                global_token_num,
+                delta_time,
+                images_seqlens=images_seqlens,
+                step5_image_shapes=step5_shapes,
+                forward_only=forward_only,
             )
             final_metrics["mfu"] = estimated_flops / promised_flops / torch.distributed.get_world_size()
             if forward_only:
@@ -379,6 +386,17 @@ class TrainingWorker(Worker, DistProfilerExtension):
         disable_auto_offload = tu.get(data, key="disable_auto_offload", default=False)
         images_seqlens = tu.get(data, key="images_seqlens", default=None)
 
+        is_step5 = getattr(getattr(self.model_config, "hf_config", None), "model_type", None) in ("step5", "step5_vl")
+        step5_shapes = None
+        if is_step5:
+            # Recompute from this mini-batch after PPO shuffling/splitting, not full-rollout metadata.
+            step5_shapes = step5_image_shapes(tu.get(data, "multi_modal_inputs", default=[]))
+            dp_group = self.engine.get_data_parallel_group()
+            if dp_group is not None:
+                shapes_by_rank = [None] * torch.distributed.get_world_size(dp_group)
+                torch.distributed.all_gather_object(shapes_by_rank, step5_shapes, dp_group)
+                step5_shapes = [shape for shapes in shapes_by_rank for shape in shapes]
+
         # inject engineering parameters if not specified
         default_keys = dict(
             use_remove_padding=self.model_config.get("use_remove_padding", False),
@@ -397,9 +415,16 @@ class TrainingWorker(Worker, DistProfilerExtension):
             Timer(name="train_batch", logger=None) as timer,
         ):
             output = self.engine.train_batch(data, loss_function=self.loss_fn)
+            if is_step5:
+                get_torch_device().synchronize()
             # containing loss, model_output and metrics
             # for training, we only care about loss and metrics
         delta_time = timer.last
+        if is_step5:
+            # All actor ranks must use the same elapsed time; include the slowest rank.
+            elapsed = torch.tensor(delta_time, dtype=torch.float32, device=self.device_name)
+            torch.distributed.all_reduce(elapsed, op=torch.distributed.ReduceOp.MAX)
+            delta_time = elapsed.item()
 
         update_lr_scheduler = tu.get(data, key="update_lr_scheduler", default=False)
         # update lr scheduler
@@ -419,6 +444,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 delta_time=delta_time,
                 forward_only=False,
                 images_seqlens=images_seqlens,
+                step5_shapes=step5_shapes,
             ).cpu()
         else:
             final_output = None
