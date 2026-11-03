@@ -100,7 +100,17 @@ def align_step5_vision_calls(model):
             and image_embeds is None
             and (patch_pixel_values is None or patch_pixel_values.numel() == 0)
         ):
-            dummy = self._encode_images(pixel_values.new_zeros((1, 3, 504, 504)))
+            dummy_side = 504
+            if (
+                getattr(self.config, "freeze_vision_encoder", False)
+                and getattr(self.config, "freeze_vision_projector", False)
+                and not any(parameter.requires_grad for parameter in self.vision_model.parameters())
+                and not any(parameter.requires_grad for parameter in self.vit_large_projector.parameters())
+            ):
+                # Keep every FSDP unit in the same collective order while doing
+                # only a 4x4 patch grid through the two stride-2 downsamplers.
+                dummy_side = 4 * self.vision_model.patch_size
+            dummy = self._encode_images(pixel_values.new_zeros((1, 3, dummy_side, dummy_side)))
             features = features + dummy.float().sum().to(features.dtype) * 0.0
         return features
 
