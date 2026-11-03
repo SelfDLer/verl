@@ -81,6 +81,14 @@ strategy: fsdp
 # Mixed precision training param dtype
 dtype: bfloat16 # ["bfloat16", "float16"]
 
+# Typed replay config is required by Hydra's recursive dataclass conversion.
+# Step5 FSDP-Turbo supports disabled and R3; R3 also requires rollout route recording.
+router_replay:
+  _target_: verl.workers.config.EngineRouterReplayConfig
+  mode: disabled
+  record_file: null
+  replay_file: null
+
 # QAT (Quantization-Aware Training) configuration
 qat:
 
