@@ -13,12 +13,15 @@
 """FSDP-Turbo hooks for Step5; keep other model engines independent of this dependency."""
 
 import json
+import logging
 from collections import defaultdict
 from pathlib import Path
 
 import torch
 
 from . import ModelAdapter
+
+logger = logging.getLogger(__name__)
 
 
 @torch.no_grad()
@@ -45,6 +48,29 @@ def restore_fp32_checkpoint_tensors(module, checkpoint_path):
                 if value.shape != tensor.shape:
                     raise ValueError(f"Checkpoint shape mismatch for {name}: {value.shape} != {tensor.shape}")
                 tensor.copy_(value)
+
+
+def configure_step5_vision_freezing(module, config):
+    """Apply independent vision/projector freeze flags before FSDP and optimizer setup.
+
+    Missing flags preserve existing trainability. False never unfreezes parameters
+    frozen by another mechanism.
+    """
+    targets = (
+        ("freeze_vision_encoder", "vision_model"),
+        ("freeze_vision_projector", "vit_large_projector"),
+    )
+    for flag, name in targets:
+        enabled = getattr(config, flag, False)
+        if not isinstance(enabled, bool):
+            raise ValueError(f"{flag} must be a boolean, got {enabled!r}")
+        if enabled and not isinstance(getattr(module, name, None), torch.nn.Module):
+            raise ValueError(f"{flag} requires model submodule {name}")
+    for flag, name in targets:
+        if getattr(config, flag, False):
+            target = getattr(module, name)
+            target.requires_grad_(False)
+            logger.info("Step5 froze %s (%s parameters)", name, sum(p.numel() for p in target.parameters()))
 
 
 class Step5ModelAdapter(ModelAdapter):
@@ -82,6 +108,7 @@ class Step5ModelAdapter(ModelAdapter):
         convert_step5_model_dtype(module, torch.bfloat16)
         restore_fp32_checkpoint_tensors(module, engine.model_config.local_path)
         align_step5_vision_calls(module)
+        configure_step5_vision_freezing(module, config)
         return module
 
     def prepare_fsdp(self, engine, module):
