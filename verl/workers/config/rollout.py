@@ -270,6 +270,8 @@ class RolloutConfig(BaseConfig):
     quantization_config_file: Optional[str] = None
 
     enable_rollout_routing_replay: bool = False
+    # Explicit opt-in for custom vLLM builds with backported R3 capture fixes.
+    allow_routing_replay_version_override: bool = False
     moe_load_balance_metrics_interval: int = 0
 
     enable_sleep_mode: bool = True

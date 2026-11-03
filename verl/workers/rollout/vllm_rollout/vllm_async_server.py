@@ -446,10 +446,17 @@ class vLLMHttpServer:
             # buffer and crash with an IndexError. Fail fast with an actionable message
             # instead of surfacing an opaque runtime error deep inside vLLM.
             if _VLLM_VERSION < version.parse("0.22.0"):
-                raise RuntimeError(
-                    "rollout.enable_rollout_routing_replay=True requires vLLM >= 0.22.0 "
-                    f"(installed: {vllm.__version__}). Upgrade vLLM (e.g. `pip install -U "
-                    "'vllm>=0.22.0'`) or disable enable_rollout_routing_replay."
+                if not self.config.allow_routing_replay_version_override:
+                    raise RuntimeError(
+                        "rollout.enable_rollout_routing_replay=True requires vLLM >= 0.22.0 "
+                        f"(installed: {vllm.__version__}). For a custom build with verified "
+                        "R3 capture fixes, explicitly set "
+                        "rollout.allow_routing_replay_version_override=True."
+                    )
+                logger.warning(
+                    "Bypassing the R3 vLLM version check for custom build %s; "
+                    "R3 capture and hybrid KV-cache fixes must be provided by this build.",
+                    vllm.__version__,
                 )
             args.update({"enable_return_routed_experts": True})
 
