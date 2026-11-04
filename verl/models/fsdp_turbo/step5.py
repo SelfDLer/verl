@@ -77,9 +77,15 @@ class Step5ModelAdapter(ModelAdapter):
     def build_module(self, engine, default_builder):
         if engine.engine_config.router_replay.mode not in ("disabled", "R3"):
             raise ValueError("Step5 FSDP-Turbo supports router_replay modes disabled and R3")
-        if engine.use_remove_padding or engine._is_ulysses_enabled():
-            raise ValueError("Step5 requires use_remove_padding=False and Ulysses size 1")
         distributed = engine.fsdp_turbo_config.distributed
+        if engine.use_remove_padding and any(size != 1 for size in (
+            distributed.tensor_parallel_size,
+            distributed.ulysses_parallel_size,
+            distributed.kcp_parallel_size,
+            distributed.kv_allgather_parallel_size,
+            engine.ulysses_sequence_parallel_size,
+        )):
+            raise ValueError("Step5 packed TND requires TP and context parallel sizes of 1")
         if distributed.expert_parallel_size > 1:
             config = engine.model_config.hf_config
             text_config = getattr(config, "text_config", config)
@@ -140,26 +146,73 @@ class Step5ModelAdapter(ModelAdapter):
                 yield step5_hf_weight_name(name), tensor
 
     def prepare_model_inputs(self, engine, micro_batch, model_inputs):
-        """Pad rollout routes exactly like tokens, without a next-token shift."""
+        """Translate packed token boundaries and align optional rollout routes."""
+        pad_size = 0
+        if engine.use_remove_padding:
+            tokens = micro_batch["input_ids"]
+            packed_tokens = model_inputs["input_ids"]
+            if not tokens.is_nested or packed_tokens.ndim != 2 or packed_tokens.shape[0] != 1:
+                raise ValueError("Step5 remove padding requires nested tokens packed into [1, T]")
+            offsets = tokens.offsets().to(device=packed_tokens.device, dtype=torch.long)
+            valid_length = tokens.values().shape[0]
+            pad_size = packed_tokens.shape[1] - valid_length
+            if pad_size < 0:
+                raise ValueError("Step5 packed inputs cannot be shorter than their token offsets")
+            actual_seq_len = offsets[1:]
+            if pad_size:
+                # Isolate engine-added alignment padding as a separate document.
+                actual_seq_len = torch.cat(
+                    [actual_seq_len, actual_seq_len.new_tensor([packed_tokens.shape[1]])]
+                )
+                positions = model_inputs.get("position_ids")
+                if positions is not None:
+                    positions = positions.clone()
+                    positions[..., valid_length:] = torch.arange(
+                        pad_size, device=positions.device, dtype=positions.dtype
+                    )
+                    model_inputs["position_ids"] = positions
+            model_inputs.pop("cu_seqlens", None)
+            model_inputs.pop("cu_seqlens_cpu", None)
+            model_inputs["actual_seq_len"] = actual_seq_len
+            model_inputs["sfa_layout"] = "TND"
         if engine.engine_config.router_replay.mode == "disabled":
             return model_inputs
         routes = micro_batch.get("routed_experts")
         if routes is None:
             raise ValueError("Step5 R3 requires routed_experts; enable rollout.enable_rollout_routing_replay")
+        if engine.use_remove_padding and not routes.is_nested:
+            raise ValueError("Step5 packed R3 requires jagged routes with the same offsets as input_ids")
         if routes.is_nested:
             tokens = micro_batch["input_ids"]
             if not tokens.is_nested or not torch.equal(routes.offsets(), tokens.offsets()):
                 raise ValueError("Step5 R3 routes and input_ids must have identical per-sample lengths")
-            batch_size, sequence_length = model_inputs["input_ids"].shape
-            routes = torch.nested.to_padded_tensor(
-                routes, padding=0, output_size=(batch_size, sequence_length, *routes.shape[2:])
-            )
+            if engine.use_remove_padding:
+                # Routes describe the current input token, before the label shift.
+                routes = routes.values()
+                if pad_size:
+                    suffix = routes.new_full((pad_size, *routes.shape[1:]), -1)
+                    routes = torch.cat((routes, suffix))
+                routes = routes.unsqueeze(0)
+            else:
+                batch_size, sequence_length = model_inputs["input_ids"].shape
+                routes = torch.nested.to_padded_tensor(
+                    routes, padding=0, output_size=(batch_size, sequence_length, *routes.shape[2:])
+                )
         model_inputs["routed_experts"] = routes
         response_mask = micro_batch.get("response_mask")
+        sample_mask = None
         if response_mask is not None:
             # Synthetic padding samples have tokens but no policy loss or routes.
-            model_inputs["routing_replay_sample_mask"] = (
+            sample_mask = (
                 torch.stack([sample.bool().any() for sample in response_mask.unbind()])
                 if response_mask.is_nested else response_mask.bool().any(dim=-1)
             )
+            if sample_mask.shape != (micro_batch["input_ids"].size(0),):
+                raise ValueError("Step5 routing replay requires one response mask per trajectory")
+        if pad_size:
+            if sample_mask is None:
+                sample_mask = routes.new_ones(micro_batch["input_ids"].size(0), dtype=torch.bool)
+            sample_mask = torch.cat((sample_mask, sample_mask.new_zeros(1)))
+        if sample_mask is not None:
+            model_inputs["routing_replay_sample_mask"] = sample_mask
         return model_inputs
