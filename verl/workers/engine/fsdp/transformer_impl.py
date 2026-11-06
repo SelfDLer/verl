@@ -353,7 +353,9 @@ class FSDPEngine(BaseEngine):
             # Copy adapter to local if needed
             local_adapter_path = copy_to_local(lora_adapter_path, use_shm=self.model_config.use_shm)
 
-            module = PeftModel.from_pretrained(module, local_adapter_path, is_trainable=True)
+            peft_config = LoraConfig.from_pretrained(local_adapter_path)
+            module, peft_config = self._prepare_lora_module(module, peft_config)
+            module = PeftModel.from_pretrained(module, local_adapter_path, is_trainable=True, config=peft_config)
             peft_config = module.peft_config["default"]
             # Ensure task_type is TaskType enum, not string
             if isinstance(peft_config.task_type, str):
@@ -369,7 +371,8 @@ class FSDPEngine(BaseEngine):
                 "exclude_modules": convert_to_regular_types(self.model_config.exclude_modules),
                 "bias": "none",
             }
-            module = get_peft_model(module, LoraConfig(**lora_config))
+            module, peft_config = self._prepare_lora_module(module, LoraConfig(**lora_config))
+            module = get_peft_model(module, peft_config)
 
             # FSDP requires all params in a flat group to share dtype: cast a
             # fp32 adapter to the bf16 base dtype only when they actually differ.
@@ -385,6 +388,10 @@ class FSDPEngine(BaseEngine):
                         param.data = param.data.to(base_dtype)
 
         return module
+
+    def _prepare_lora_module(self, module, config):
+        """Allow an engine to prepare custom projection modules before PEFT injection."""
+        return module, config
 
     def _build_fsdp_module(self, module):
         # TODO(ziheng): need to improve

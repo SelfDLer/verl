@@ -53,6 +53,12 @@ class FSDPTurboEngineWithLMHead(FSDPEngineWithLMHead):
         finally:
             self.ulysses_sequence_parallel_size = cp_size
 
+    def _prepare_lora_module(self, module, config):
+        self._model_adapter.prepare_lora(self, module, config)
+        from verl.utils.peft_grouped_linear import register_grouped_lora
+
+        return module, register_grouped_lora(config)
+
     def _build_fsdp_module(self, module):
         from fsdp_turbo.fsdp_turbo import FSDPTurbo
 

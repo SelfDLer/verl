@@ -865,7 +865,7 @@ def normalize_peft_param_name(params: dict) -> dict:
     return params
 
 
-def _merge_or_unmerge_lora_(module, merge: bool):
+def _merge_or_unmerge_lora_(module, merge: bool, skip_nested_fsdp: bool = False):
     """Merge or unmerge LoRA adapters in a module.
 
     Args:
@@ -874,8 +874,15 @@ def _merge_or_unmerge_lora_(module, merge: bool):
     """
     from peft.tuners.lora import LoraLayer
 
+    def owned_modules(current):
+        yield current
+        for child in current.children():
+            if skip_nested_fsdp and isinstance(child, FSDPModule):
+                continue
+            yield from owned_modules(child)
+
     with torch.no_grad():
-        for m in module.modules():
+        for m in owned_modules(module):
             if isinstance(m, LoraLayer):
                 is_merged = getattr(m, "merged", False)
                 if merge and not is_merged:
@@ -919,7 +926,9 @@ def fsdp_merge_unmerge(module: nn.Module, do_merge: bool):
         for name, submodule in module.named_modules():
             if isinstance(submodule, FSDPModule) and name != "":  # skip root model
                 with FSDP.summon_full_params(submodule, writeback=True, with_grads=False):
-                    _merge_or_unmerge_lora_(submodule, merge=do_merge)
+                    # A parent unshard does not unshard separately managed expert
+                    # units. Merge their adapters only inside their own context.
+                    _merge_or_unmerge_lora_(submodule, merge=do_merge, skip_nested_fsdp=True)
 
 
 def collect_merged_lora_params(module: nn.Module) -> OrderedDict:

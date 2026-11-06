@@ -8,6 +8,8 @@ Examples that focus on *tuning-related* features rather than on a specific RL al
 
 Canonical LoRA GRPO scripts (training only adapters, rollout still serves the adapter via `load_format=safetensors + layered_summon`).
 
+For Step5 FSDP-Turbo attention/expert target selection and merged rollout, see [Step5 LoRA](lora/README.step5.md).
+
 | Script                                         | Model             | Infer | Train    | Notes                       |
 |------------------------------------------------|-------------------|-------|----------|-----------------------------|
 | `run_qwen3_8b_fsdp.sh`               | Qwen3-8B          | vLLM  | FSDP     | text, GSM8K                 |

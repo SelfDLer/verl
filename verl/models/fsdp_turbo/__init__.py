@@ -26,6 +26,10 @@ class ModelAdapter:
         """Construct the model using the engine default."""
         return default_builder()
 
+    def prepare_lora(self, engine, module, config):
+        """Prepare custom projection layouts before PEFT injection or reload."""
+        pass
+
     def prepare_fsdp(self, engine, module):
         """Apply model-specific preparation before sharding, when needed."""
         pass

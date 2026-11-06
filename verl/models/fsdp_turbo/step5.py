@@ -15,6 +15,7 @@
 import json
 import logging
 from collections import defaultdict
+from copy import deepcopy
 from pathlib import Path
 
 import torch
@@ -117,8 +118,46 @@ class Step5ModelAdapter(ModelAdapter):
         configure_step5_vision_freezing(module, config)
         return module
 
+    def prepare_lora(self, engine, module, config):
+        """Infer expert adaptation from PEFT targets, without a second LoRA switch."""
+        from fsdp_turbo.models.step5 import prepare_step5_model_for_fsdp
+        from fsdp_turbo.models.step5.modeling_step5 import Step5MoE
+        from peft.tuners.tuners_utils import check_target_module_exists
+
+        expert_targets = any(
+            check_target_module_exists(config, f"{name}.experts.{projection}")
+            for name, child in module.named_modules()
+            if isinstance(child, Step5MoE)
+            for projection in ("gate_up_proj", "down_proj")
+        )
+        if expert_targets:
+            distributed = engine.fsdp_turbo_config.distributed
+            if distributed.expert_parallel_size > 1 and distributed.ep_plan.dispatcher not in (
+                "custom_native_eager_forward",
+                "custom_native_eager_fused_forward",
+            ):
+                raise ValueError("Step5 expert LoRA requires a native eager EP dispatcher")
+            prepare_step5_model_for_fsdp(module, fuse_gate_up=True, grouped_projections=True)
+
     def prepare_fsdp(self, engine, module):
         from fsdp_turbo.models.step5 import configure_step5_fsdp_plan, prepare_step5_model_for_fsdp
+
+        if hasattr(module, "peft_config"):
+            if not engine.model_config.lora.get("merge", False):
+                raise ValueError("Step5 LoRA requires model.lora.merge=true for rollout weight sync")
+            allowed = (
+                "self_attn.q_proj",
+                "self_attn.k_proj",
+                "self_attn.v_proj",
+                "self_attn.o_proj",
+                "moe.experts.gate_up_proj",
+                "moe.experts.down_proj",
+            )
+            adapters = [name for name, child in module.named_modules() if hasattr(child, "lora_A")]
+            if not adapters or any(not name.endswith(allowed) for name in adapters):
+                raise ValueError(
+                    "Step5 LoRA supports only text self_attn q_proj/k_proj/v_proj/o_proj and routed experts"
+                )
 
         distributed = engine.fsdp_turbo_config.distributed
         fuse_gate_up = distributed.expert_parallel_size > 1 and distributed.ep_plan.dispatcher in (
@@ -127,6 +166,28 @@ class Step5ModelAdapter(ModelAdapter):
         )
         prepare_step5_model_for_fsdp(module, fuse_gate_up=fuse_gate_up)
         configure_step5_fsdp_plan(engine.fsdp_turbo_config.distributed.fsdp_plan)
+        if hasattr(module, "peft_config"):
+            # PEFT adds base_model.model to every base-model path. Keep the
+            # caller's plan intact and preserve the PEFT root for disable_adapter
+            # and merged weight export in the parent FSDP engine.
+            config = deepcopy(engine.fsdp_turbo_config)
+            prefix = "base_model.model."
+
+            def prefixed(pattern):
+                return pattern if pattern.startswith(prefix) else prefix + pattern
+
+            fsdp = config.distributed.fsdp_plan
+            fsdp.apply_modules = {prefixed(name): plan for name, plan in fsdp.apply_modules.items()}
+            fsdp.ignored_modules = [prefixed(name) for name in (fsdp.ignored_modules or [])]
+            fsdp.hook_modules = [prefixed(name) for name in (fsdp.hook_modules or [])]
+            ep = config.distributed.ep_plan
+            ep.apply_modules = [prefixed(name) for name in (ep.apply_modules or [])]
+            ep.apply_efsdp_modules = [prefixed(name) for name in (ep.apply_efsdp_modules or [])]
+            config.memory.recompute_plan = [prefixed(name) for name in (config.memory.recompute_plan or [])]
+            for plan in (config.memory.chunk_batch_plan, config.memory.swap_activation_plan):
+                if plan is not None:
+                    plan.apply_modules = [prefixed(name) for name in (plan.apply_modules or [])]
+            engine.fsdp_turbo_config = config
 
     def export_weights(self, weights):
         from verl.models.transformers.step5 import step5_hf_weight_name
@@ -135,6 +196,8 @@ class Step5ModelAdapter(ModelAdapter):
         # hook, gathering both the EP and E-FSDP dimensions. Restore the HF
         # stacked layout after that collective, never split a local shard.
         for name, tensor in weights:
+            if name.endswith((".moe.experts.gate_up_proj.weight", ".moe.experts.down_proj.weight")):
+                name = name.removesuffix(".weight")
             if name.endswith(".moe.experts.gate_up_proj"):
                 if tensor.ndim != 3 or tensor.shape[1] % 2:
                     raise ValueError(f"Invalid Step5 fused expert shape: {name} {tuple(tensor.shape)}")
