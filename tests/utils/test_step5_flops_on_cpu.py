@@ -111,6 +111,103 @@ def test_vision_convolutions_attention_and_projector():
     assert (actual - base) * 1e12 == pytest.approx(2 * expected)
 
 
+@pytest.mark.parametrize(
+    ("freeze_encoder", "freeze_projector", "expected_per_image"),
+    [
+        (False, False, 42240),
+        (False, True, 41984),
+        (True, False, 14848),
+        (True, True, 14592),
+    ],
+)
+def test_vision_freeze_flags_follow_gradient_requirements(freeze_encoder, freeze_projector, expected_per_image):
+    cfg = SimpleNamespace(
+        model_type="step5_vl",
+        text_config=config(),
+        freeze_vision_encoder=freeze_encoder,
+        freeze_vision_projector=freeze_projector,
+        vision_config=SimpleNamespace(
+            width=4,
+            patch_size=2,
+            mlp_ratio=2,
+            num_channels=3,
+            layers=1,
+            use_cls_token=False,
+        ),
+    )
+    # Forward-only: patch=1536, ViT=8192, downsample convolutions=4608,
+    # projector=256 FLOPs. Downsampling belongs to the encoder.
+    # The patch has no input gradient. The projector needs dInput iff the
+    # encoder trains, and dWeight iff the projector trains, independently.
+    base = estimate_step5_flops(cfg, 3, [3], 1)
+    actual = estimate_step5_flops(cfg, 3, [3], 1, step5_image_shapes=[(8, 8)] * 2)
+    assert (actual - base) * 1e12 == pytest.approx(2 * expected_per_image)
+
+
+@pytest.mark.parametrize("as_dict", [False, True])
+def test_aux_disabled_preserves_eager_indexer_scoring(as_dict):
+    sparse = dict(
+        enabled=True,
+        proxy_dim=2,
+        sparse_indexer_num_heads=2,
+        region_block_size=2,
+        topk=1,
+        apply_to_layer_types=["full_attention"],
+    )
+    cfg = config(
+        sparse_config=sparse if as_dict else SimpleNamespace(**sparse),
+        enable_dsa_aux_loss=False,
+    )
+    # With eager selection, turning aux off removes only the detached teacher:
+    # indexer projections and all four visible-region scores still execute.
+    expected = (6 * 608 + 2 * 80) * 5 + 12 * 8 * 13 + 2 * 2 * 2 * 4
+    actual = estimate_step5_flops(cfg, 5, [5], 1) * 1e12
+    assert actual == pytest.approx(expected)
+    cfg.enable_dsa_aux_loss = True
+    with_teacher = estimate_step5_flops(cfg, 5, [5], 1) * 1e12
+    assert with_teacher - actual == pytest.approx(2 * 8 * 2 * 4)
+
+
+@pytest.mark.parametrize(
+    ("block", "topk", "lengths"),
+    [
+        (2, 1, [0, 1, 4]),
+        (2, 1, [4, 5, 7]),
+        (8, 512, [4103]),
+        (8, 512, [4104]),
+        (8, 512, [4105]),
+        (8, 512, [4104, 4105, 4112]),
+    ],
+)
+def test_gbsa_aux_disabled_scores_only_sparse_tail(block, topk, lengths):
+    cfg = config(
+        enable_dsa_aux_loss=False,
+        use_gbsa_full_sequence=True,
+        sparse_config=SimpleNamespace(
+            enabled=True,
+            proxy_dim=2,
+            sparse_indexer_num_heads=2,
+            region_block_size=block,
+            topk=topk,
+            apply_to_layer_types=["full_attention"],
+        ),
+    )
+    tokens = sum(lengths)
+    # Independent query-by-query reference: complete selected regions plus
+    # the causal part of the current region. Prefix queries need no scoring.
+    attention_pairs = sum(
+        min(q // block, topk) * block + q % block + 1
+        for length in lengths
+        for q in range(length)
+    )
+    scored_regions = sum(
+        q // block for length in lengths for q in range((topk + 1) * block, length)
+    )
+    expected = (6 * 608 + 2 * 80) * tokens + 12 * 8 * attention_pairs + 2 * 2 * 2 * scored_regions
+    actual = estimate_step5_flops(cfg, tokens, lengths, 1) * 1e12
+    assert actual == pytest.approx(expected, rel=1e-12)
+
+
 def test_image_shapes_no_pixel_reads_and_precomputed_embeddings():
     overview = torch.empty((2, 1, 3, 728, 728), device="meta")
     crops = torch.empty((3, 3, 504, 504), device="meta")
@@ -150,7 +247,20 @@ def test_training_worker_mfu_metadata_reduction_and_logging(monkeypatch, capsys)
 
     cfg = SimpleNamespace(
         model_type="step5_vl",
-        text_config=config(),
+        text_config=config(
+            enable_dsa_aux_loss=False,
+            use_gbsa_full_sequence=True,
+            sparse_config=SimpleNamespace(
+                enabled=True,
+                proxy_dim=2,
+                sparse_indexer_num_heads=2,
+                region_block_size=2,
+                topk=1,
+                apply_to_layer_types=["full_attention"],
+            ),
+        ),
+        freeze_vision_encoder=True,
+        freeze_vision_projector=True,
         vision_config=SimpleNamespace(
             width=4,
             patch_size=2,
@@ -208,8 +318,10 @@ def test_training_worker_mfu_metadata_reduction_and_logging(monkeypatch, capsys)
     )
     result = inspect.unwrap(workers.TrainingWorker.train_batch)(worker, data)
     mfu = tu.get(result, "metrics")["mfu"]
-    expected = estimate_step5_flops(cfg, 6, [3, 3], 2, step5_image_shapes=[(8, 8)] * 2) / 432 / 2
-    assert mfu == pytest.approx(expected, rel=1e-10)
+    # Two global sequences, each 12000 text + 14592 frozen-vision FLOPs,
+    # divided by max-rank elapsed time (2 s), device peak, and two devices.
+    expected = 2 * (12000 + 14592) / 2 / 1e12 / 432 / 2
+    assert mfu == pytest.approx(expected, rel=1e-10, abs=0)
     assert sync_calls == [True]
     tracker = Tracking(project_name="test", experiment_name="actor-mfu", default_backend="console")
     tracker.log(data={"perf/mfu/actor": mfu}, step=1)

@@ -213,6 +213,118 @@ Both scripts target Qwen3.5-2B (``FSDP_SIZE=4``, ``SP_SIZE=2``) on a single
 runs for 1 training step; the nightly script runs for 5.  Both hardcode the
 Turbo plan rather than auto-detecting the device.
 
+Step5 actor MFU
+---------------
+
+``verl/utils/step5_flops.py`` estimates useful matrix/convolution FLOPs rather
+than counting every executed kernel. A multiply-add counts as two FLOPs.
+For an actor mini-batch, let ``T`` be the sum of valid prompt and response
+lengths, ``N`` the number of actor devices and ``t`` the maximum training time
+across actor ranks. The reported fraction is:
+
+.. math::
+
+   \mathrm{MFU} = \frac{F_{\mathrm{LLM}} + F_{\mathrm{indexer}} + F_{\mathrm{vision}}}
+   {t\,N\,P_{\mathrm{peak}}}.
+
+The timer covers ``engine.train_batch`` and device synchronization. It excludes
+the surrounding parameter/optimizer load and offload, rollout generation,
+old-logprob recomputation and actor-to-rollout weight synchronization. Therefore
+``t`` differs from the outer ``timing_s/update_actor`` and whole-step timers.
+The current device table uses ``432e12`` FLOP/s per ``Ascend950DT``; this is a
+configured peak reference, not a measured device throughput.
+
+Text model
+~~~~~~~~~~
+
+For text hidden size ``H``, vocabulary ``V``, query/KV head counts ``nq``/``nkv``
+and head dimension ``d``, the active linear-weight element count is:
+
+.. math::
+
+   P_{\mathrm{linear}} = HV + \sum_l\left[
+     H(2n_q+2n_{kv})d + P_{\mathrm{gate},l} + P_{\mathrm{FFN},l}\right].
+
+The optional head-wise attention gate contributes ``H*nq``.
+A dense FFN contributes ``3*H*I_dense``. A MoE FFN contributes
+``H*E + 3*H*(k*I_expert + I_shared)``, where ``E`` is the router's expert count
+and ``k`` is its per-token top-k. Thus all router columns are counted, but only
+activated expert matrices are counted. The LM head is counted once; the
+embedding lookup is not a dense matrix multiply. MTP layers not executed by
+the actor are excluded.
+
+.. math::
+
+   F_{\mathrm{LLM}} = 6T P_{\mathrm{linear}}
+      + 12n_qd\sum_l\sum_i A_l(L_i).
+
+The factors 6 and 12 include the forward pass and both matrix gradients.
+``A_l(L)`` counts useful query/key pairs. Full causal attention uses
+``L*(L+1)/2``; sliding attention uses ``sum(min(q+1, window))``. For DSA region
+size ``b`` and selected-region limit ``K``:
+
+.. math::
+
+   A_{\mathrm{DSA}}(L) = \sum_{q=0}^{L-1}
+       \left[b\min(\lfloor q/b\rfloor,K)+(q\bmod b)+1\right].
+
+DSA indexer and auxiliary loss
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The current PPO loss consumes logits rather than ``aux_loss``. Indexer
+projections and region scoring therefore contribute forward FLOPs only; the
+discrete selection does not backpropagate into the indexer. Let ``a`` be the
+indexer head count and ``p`` its proxy dimension. For each sparse layer:
+
+.. math::
+
+   F_{\mathrm{projection}} = 2TH[(a+2)p+a], \qquad
+   R(L)=\sum_{q=0}^{L-1}\lfloor q/b\rfloor.
+
+When ``enable_dsa_aux_loss=false``, teacher QK contributes zero. With the
+current ``use_gbsa_full_sequence=true`` path, all-selected prefix indices are
+constructed directly, so only the genuinely sparse suffix needs scoring:
+
+.. math::
+
+   F_{\mathrm{score}} = 2ap\sum_i
+      [R(L_i)-R(\min(L_i,(K+1)b))].
+
+For ``b=8, K=512``, lengths up to 4104 have no region-score FLOPs. Indexer
+linear projections still execute over the whole sequence and remain counted.
+The generic eager path still scores the prefix and uses ``2ap*sum(R(L_i))``.
+With auxiliary loss enabled, the estimate retains full region scoring and
+adds forward-only teacher QK FLOPs ``2*nq*d*b*sum(R(L_i))``. This is not an
+estimator for a future training objective that actually backpropagates the
+indexer auxiliary loss.
+
+Frozen vision modules
+~~~~~~~~~~~~~~~~~~~~~
+
+Freeze flags come from the effective model config after overrides:
+``freeze_vision_encoder`` and ``freeze_vision_projector`` default to false.
+Both spatial downsampling convolutions belong to ``vision_model``. Only the
+last linear layer belongs to ``vit_large_projector``.
+
+Let ``e=1`` when the encoder is trainable, otherwise 0; define ``p`` similarly
+for the projector. Each component's forward FLOPs are multiplied by:
+
+* Patch projection: ``1+e`` (pixels do not need an input gradient).
+* ViT blocks and both downsamplers: ``1+2e``.
+* Final projector: ``1+e+p`` (input gradient depends on the encoder, weight
+  gradient on the projector).
+
+Consequently, freezing both modules counts their forward passes once, with no
+vision backward FLOPs. Freezing only the projector still counts its input
+gradient when the encoder is trainable. Real overview/crop shapes from each
+PPO mini-batch determine token counts; precomputed image embeddings and dummy
+vision calls contribute no vision FLOPs.
+
+This remains an analytical MFU: recomputation, padding, optimizer work,
+normalization, activation functions, routing/top-k and communication are not
+added to the FLOPs numerator. Their runtime can still lower MFU. It is not
+hardware FLOP utilization or whole-RL-step utilization.
+
 Source of truth
 ---------------
 

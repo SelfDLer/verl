@@ -11,15 +11,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Useful model FLOPs for Step5 full-parameter actor training.
+"""Useful model FLOPs for Step5 actor training with optional vision freezing.
 
 Counts multiply-add as two FLOPs, backward as twice forward for trainable
 matmuls. Counts causal/SWA/DSA token pairs, activated experts, and real image
 crops. Excludes recomputation, dummy vision calls, padding, optimizer,
 normalization, activations, routing/top-k and communication (MFU, not HFU).
-The current PPO loss does not consume Step5's aux_loss: DSA indexer projections,
-region scores and detached teacher QK scores are forward-only. MTP metadata does not
-represent executed layers in the current FSDPTurbo Step5 actor.
+The current PPO loss does not consume Step5's aux_loss: executed DSA indexer
+projections, region scores and detached teacher QK scores are forward-only.
+Honor the aux-loss switch and the GBSA full-sequence selection path. Frozen vision
+modules retain forward work, but only propagate gradients where needed. MTP
+metadata does not represent executed layers in the current FSDPTurbo Step5 actor.
 """
 
 import math
@@ -62,24 +64,36 @@ def _region_pairs(length, block, topk=None):
     return block * (topk * (topk - 1) // 2 + (blocks - topk) * topk) + tail * topk
 
 
-def _vision_flops(config, text_hidden, image_shapes):
+def _vision_flops(config, text_hidden, image_shapes, *, freeze_encoder=False, freeze_projector=False):
+    """Count encoder/projector matmuls with their actual gradient dependencies.
+
+    Both spatial downsamplers belong to the encoder. Only the final linear
+    projection belongs to the separately freezable projector. Its input gradient
+    is still needed when the encoder is trainable, even if the projector is frozen.
+    """
     width = config.width
     patch = config.patch_size
     mlp = int(width * config.mlp_ratio)
+    encoder_trainable = int(not freeze_encoder)
+    projector_trainable = int(not freeze_projector)
+    encoder_factor = 1 + 2 * encoder_trainable
+    projector_factor = 1 + encoder_trainable + projector_trainable
     total = 0
     for (height, image_width), count in Counter(map(tuple, image_shapes)).items():
         if height <= 0 or image_width <= 0 or height % patch or image_width % patch:
             raise ValueError("Step5 image dimensions must be positive multiples of patch_size")
         h, w = height // patch, image_width // patch
         tokens = h * w + int(_get(config, "use_cls_token", False))
-        # Patch input has no gradient; convolution has forward + weight gradient.
-        flops = 4 * h * w * config.num_channels * patch**2 * width
-        flops += config.layers * (6 * tokens * (4 * width**2 + 2 * width * mlp) + 12 * tokens**2 * width)
+        # Pixels never require gradients; a trainable patch projection adds dWeight only.
+        flops = 2 * (1 + encoder_trainable) * h * w * config.num_channels * patch**2 * width
+        flops += encoder_factor * config.layers * (
+            2 * tokens * (4 * width**2 + 2 * width * mlp) + 4 * tokens**2 * width
+        )
         h, w = (h + 1) // 2, (w + 1) // 2
-        flops += 6 * h * w * 9 * width * (2 * width)
+        flops += 2 * encoder_factor * h * w * 9 * width * (2 * width)
         h, w = (h + 1) // 2, (w + 1) // 2
-        flops += 6 * h * w * 9 * (2 * width) * (4 * width)
-        flops += 6 * h * w * (4 * width) * text_hidden
+        flops += 2 * encoder_factor * h * w * 9 * (2 * width) * (4 * width)
+        flops += 2 * projector_factor * h * w * (4 * width) * text_hidden
         total += count * flops
     return total
 
@@ -102,6 +116,8 @@ def estimate_step5_flops(config, tokens_sum, batch_seqlens, delta_time, **kwargs
         raise ValueError("Invalid Step5 token lengths")
     moe_layers = set(text.moe_layer_list) if text.use_moe else set()
     sparse = _get(text, "sparse_config")
+    enable_aux_loss = _get(text, "enable_dsa_aux_loss", True)
+    gbsa_full_sequence = _get(text, "use_gbsa_full_sequence", False)
     # Embedding lookup is not a dense matmul. Count the LM head once, even when tied.
     linear_params = hidden * text.vocab_size
     attention_flops = 0
@@ -133,7 +149,14 @@ def estimate_step5_flops(config, tokens_sum, batch_seqlens, delta_time, **kwargs
                 local_pairs = _causal_pairs(length) - block * regions
                 pairs = local_pairs + block * _region_pairs(length, block, topk)
                 # PPO consumes logits, not aux_loss; top-k indices do not propagate gradients.
-                attention_flops += count * (2 * index_heads * proxy * regions + 2 * heads * dim * block * regions)
+                score_regions = regions
+                if gbsa_full_sequence and not enable_aux_loss:
+                    # GBSA constructs all-selected prefix indices without region scoring.
+                    prefix_length = min(length, (topk + 1) * block)
+                    score_regions -= _region_pairs(prefix_length, block)
+                attention_flops += count * 2 * index_heads * proxy * score_regions
+                if enable_aux_loss:
+                    attention_flops += count * 2 * heads * dim * block * regions
             else:
                 window = text.sliding_window if layer_type == "sliding_attention" else None
                 if window is not None and window <= 0:
@@ -143,5 +166,11 @@ def estimate_step5_flops(config, tokens_sum, batch_seqlens, delta_time, **kwargs
     total = (6 * linear_params + 2 * indexer_forward_params) * tokens_sum + attention_flops
     image_shapes = kwargs.get("step5_image_shapes") or []
     if image_shapes:
-        total += _vision_flops(config.vision_config, hidden, image_shapes)
+        total += _vision_flops(
+            config.vision_config,
+            hidden,
+            image_shapes,
+            freeze_encoder=_get(config, "freeze_vision_encoder", False),
+            freeze_projector=_get(config, "freeze_vision_projector", False),
+        )
     return total / delta_time / 1e12
