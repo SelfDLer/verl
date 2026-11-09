@@ -103,6 +103,8 @@ def construct_minimal_padding_template(
     position_ids = build_padding_position_ids(template_sample.get("position_ids"), attention_mask)
     routed_experts = build_padding_routed_experts(template_sample.get("routed_experts"), input_ids.size(0))
 
+    if "step5_region_frames" in template_sample:
+        template_sample["step5_region_frames"] = b""
     sequence_length = input_ids.size(0)
     teacher_ids = template_sample.get("teacher_ids")
     if teacher_ids is not None:

@@ -740,6 +740,9 @@ class vLLMHttpServer:
             result_dict=extra_fields,
         )
         token_ids = final_res.outputs[0].token_ids
+        frames = getattr(final_res.outputs[0], "step5_region_frames", None)
+        if frames is not None:
+            extra_fields["step5_region_frames"] = frames
         log_probs = None
         if sampling_params.logprobs:
             # indexing FlatLogprobs per position would rebuild a k+1 dict per token

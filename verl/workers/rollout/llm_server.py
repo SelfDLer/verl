@@ -280,6 +280,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             num_preempted=0,
         )
         min_global_steps, max_global_steps = None, None
+        region_chunks = []
         # Prefix-cache hits are reported per prefill. The base client returns the
         # server's TokenOutput directly (so sync mode surfaces num_cached_tokens),
         # but here we rebuild a fresh TokenOutput across resume iterations, so we
@@ -304,6 +305,8 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             final_output.token_ids.extend(output.token_ids)
             if output.log_probs is not None:
                 final_output.log_probs.extend(output.log_probs)
+            if output.token_ids and "step5_region_frames" in output.extra_fields:
+                region_chunks.append(output.extra_fields["step5_region_frames"])
             # On partial rollout resume the model version may differ, so keep
             # existing routing and only append routing for newly generated tokens.
             if output.routed_experts is not None and len(output.token_ids) > 0:
@@ -355,6 +358,8 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             await asyncio.sleep(1)
 
         final_output.extra_fields["global_steps"] = global_steps
+        if region_chunks:
+            final_output.extra_fields["step5_region_frames"] = b"".join(region_chunks)
         final_output.extra_fields["min_global_steps"] = min_global_steps
         final_output.extra_fields["max_global_steps"] = max_global_steps
         final_output.extra_fields["num_cached_tokens"] = num_cached_tokens

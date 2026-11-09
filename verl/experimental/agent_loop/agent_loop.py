@@ -150,6 +150,9 @@ class AgentLoopOutput(BaseModel):
         # Mutating a default dict does not add the field to Pydantic's fields-set,
         # so model_dump(exclude_unset=True) can omit populated extra fields.
         extra_fields = output.setdefault("extra_fields", self.extra_fields.copy())
+        region_frames = extra_fields.pop("step5_region_frames", None)
+        if region_frames is not None:
+            output["step5_region_frames"] = region_frames
         teacher_ids, teacher_logprobs = (
             extra_fields.pop("teacher_ids", None),
             extra_fields.pop("teacher_logprobs", None),

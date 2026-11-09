@@ -238,6 +238,19 @@ class Step5ModelAdapter(ModelAdapter):
             model_inputs.pop("cu_seqlens_cpu", None)
             model_inputs["actual_seq_len"] = actual_seq_len
             model_inputs["sfa_layout"] = "TND"
+        if engine.use_remove_padding and engine.engine_config.router_replay.mode == "R3":
+            from fsdp_turbo.utils.region_replay import RegionReplay
+            from verl.utils.tensordict_utils import get
+
+            payloads = get(micro_batch, "step5_region_frames")
+            # Older trajectories have expert routes only; select their regions natively.
+            if payloads is not None:
+                if isinstance(payloads, bytes):
+                    payloads = [payloads] * micro_batch["input_ids"].size(0)
+                replay = tuple(RegionReplay(payload) for payload in payloads)
+                if pad_size:
+                    replay += (RegionReplay(b""),)
+                model_inputs["region_replay"] = replay
         if engine.engine_config.router_replay.mode == "disabled":
             return model_inputs
         routes = micro_batch.get("routed_experts")
