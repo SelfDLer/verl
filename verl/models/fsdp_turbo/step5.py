@@ -96,6 +96,7 @@ class Step5ModelAdapter(ModelAdapter):
                 "custom_native_eager_forward",
                 "custom_native_eager_fused_forward",
                 "custom_native_mc2_forward",
+                "custom_native_deepep_mc2_forward",
             ):
                 raise ValueError("Step5 EP requires a Step5 native dispatcher to preserve FP32 combine")
 
@@ -163,6 +164,7 @@ class Step5ModelAdapter(ModelAdapter):
         fuse_gate_up = distributed.expert_parallel_size > 1 and distributed.ep_plan.dispatcher in (
             "custom_native_eager_fused_forward",
             "custom_native_mc2_forward",
+            "custom_native_deepep_mc2_forward",
         )
         prepare_step5_model_for_fsdp(module, fuse_gate_up=fuse_gate_up)
         configure_step5_fsdp_plan(engine.fsdp_turbo_config.distributed.fsdp_plan)
