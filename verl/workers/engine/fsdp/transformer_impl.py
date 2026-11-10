@@ -1083,6 +1083,8 @@ class FSDPEngine(BaseEngine):
         has exited would silently send base weights without the adapters.
         """
         device = get_device_id()
+        # Step5 keeps norm and indexer parameters in FP32 on both sides of rollout sync.
+        is_step5 = self.model_config.hf_config.model_type == "step5_vl"
         try:
             with merged_lora_context(self.module, backup_adapters=True):
                 params = normalize_peft_param_name(self.module.state_dict())
@@ -1090,7 +1092,9 @@ class FSDPEngine(BaseEngine):
                 for name, param in params.items():
                     yield (
                         name,
-                        param.to(device, non_blocking=True).full_tensor().to(torch.bfloat16, non_blocking=True)
+                        param.to(device, non_blocking=True).full_tensor().to(
+                            param.dtype if is_step5 else torch.bfloat16, non_blocking=True
+                        )
                         if isinstance(param, DTensor)
                         # clone: plain tensors also alias module storage, and bucketed
                         # senders may flush after the restore has already run

@@ -66,6 +66,9 @@ def test_step5_expert_lora_ep_efsdp_export_and_backward():
     )
     model = Step5ForCausalLM(config)
     convert_step5_model_dtype(model, torch.bfloat16)
+    with torch.no_grad():
+        # A value that changes on BF16 rounding makes precision loss observable.
+        model.model.layers[0].input_layernorm.weight.fill_(1.001)
     turbo_config = _dict_to_dataclass(
         FSDPTurboConfig,
         {
@@ -91,7 +94,7 @@ def test_step5_expert_lora_ep_efsdp_export_and_backward():
     )
     engine = object.__new__(FSDPTurboEngineWithLMHead)
     engine.fsdp_turbo_config = turbo_config
-    engine.model_config = SimpleNamespace(lora={"merge": True})
+    engine.model_config = SimpleNamespace(lora={"merge": True}, hf_config=SimpleNamespace(model_type="step5_vl"))
     engine._is_offload_param = False
     adapter = Step5ModelAdapter()
     lora_config = LoraConfig(
@@ -118,8 +121,7 @@ def test_step5_expert_lora_ep_efsdp_export_and_backward():
     exported = dict(adapter.export_weights(engine._merged_lora_per_tensor_param()))
     assert not any("lora_" in name or "base_layer" in name for name in exported)
     for name, expected in reference.items():
-        # The existing rollout exporter casts DTensors (including FP32 norms) to BF16.
-        torch.testing.assert_close(exported[name].cpu(), expected.to(exported[name].dtype), atol=0, rtol=0, msg=name)
+        torch.testing.assert_close(exported[name].cpu(), expected, atol=0, rtol=0, msg=name)
     for name, parameter in engine.module.named_parameters():
         torch.testing.assert_close(parameter.to_local().cpu(), before[name], atol=0, rtol=0, msg=name)
     tokens = torch.tensor([[1, 2, 3, 4]], device=torch.accelerator.current_accelerator())
