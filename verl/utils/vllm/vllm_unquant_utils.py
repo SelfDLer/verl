@@ -41,7 +41,7 @@ engine starts.
 import logging
 import math
 import os
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from unittest.mock import patch
 
 import torch
@@ -163,8 +163,20 @@ def fold_unquantized_moe_params(layers: list[torch.nn.Module]):
 
     from vllm.model_executor.layers.fused_moe import unquantized_fused_moe_method
 
+    from vllm.platforms import current_platform
+
     folding = _folding_replace_parameter(unquantized_fused_moe_method.replace_parameter)
-    with patch.object(unquantized_fused_moe_method, "replace_parameter", folding):
+    with ExitStack() as patches:
+        patches.enter_context(patch.object(unquantized_fused_moe_method, "replace_parameter", folding))
+        if current_platform.device_type == "npu":
+            # Ascend imports replace_parameter into its own module namespace.
+            # Fold each transposed bank as it is produced instead of retaining
+            # the new allocations for every layer until the final fallback.
+            from vllm_ascend.ops.fused_moe import routed_experts
+
+            patches.enter_context(patch.object(
+                routed_experts, "replace_parameter", _folding_replace_parameter(routed_experts.replace_parameter)
+            ))
         yield
 
     for layer in layers:

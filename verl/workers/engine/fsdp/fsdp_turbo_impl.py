@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 import torch
 
 from verl.utils.fsdp_utils import fsdp2_load_full_state_dict
@@ -62,10 +64,20 @@ class FSDPTurboEngineWithLMHead(FSDPEngineWithLMHead):
     def _build_fsdp_module(self, module):
         from fsdp_turbo.fsdp_turbo import FSDPTurbo
 
-        self._model_adapter.prepare_fsdp(self, module)
+        rank0_experts = (
+            os.environ.get("STEP5_RANK0_EXPERT_INIT") == "1"
+            and self.model_config.hf_config.model_type == "step5_vl"
+        )
+        if rank0_experts:
+            from verl.models.fsdp_turbo.step5_expert_init import allocate_rank0_expert_shards, prepare_expert_state
 
-        full_state = module.state_dict()
+            full_state = prepare_expert_state(self, module)
+        else:
+            self._model_adapter.prepare_fsdp(self, module)
+            full_state = module.state_dict() if torch.distributed.get_rank() == 0 else {}
         module = FSDPTurbo(self.fsdp_turbo_config, module).model
+        if rank0_experts:
+            allocate_rank0_expert_shards(module)
         offload_policy = None
         if self.engine_config.offload_policy or self.engine_config.forward_only:
             self._is_offload_param = False

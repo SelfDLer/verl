@@ -68,6 +68,15 @@ class Step5RLProcessor(Step5Processor):
     def __call__(self, *args, videos=None, audio=None, **kwargs):
         if videos is not None or audio is not None:
             raise ValueError("Step5 RL currently supports images and text only")
+        # The released chat template already begins with BOS. The ByteLevel
+        # post-processor otherwise prepends a second one to the rendered prompt.
+        text = kwargs.get("text", args[0] if args else None)
+        texts = [text] if isinstance(text, str) else text
+        bos = self.tokenizer.bos_token
+        if bos and isinstance(texts, (list, tuple)) and texts and all(
+            isinstance(item, str) and item.startswith(bos) for item in texts
+        ):
+            kwargs.setdefault("add_special_tokens", False)
         return super().__call__(*args, **kwargs)
 
     def save_pretrained(self, directory, **kwargs):

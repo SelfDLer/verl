@@ -768,7 +768,15 @@ class FSDPEngine(BaseEngine):
             # inside; here every micro-batch forward (and, when training, its backward) becomes a
             # distinguishable "micro_batch<i>" row -- nested under the update loop's "mini_batch<i>"
             # when training, or directly under the stage for log-prob.
-            with ctx, sync_ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
+            micro_profile = nullcontext()
+            if not forward_only and micro_batch_idx == 0 and not getattr(self, "_actor_microbatch_profiled", False):
+                profile_dir = tu.get_non_tensor_data(data, key="actor_microbatch_profile_dir", default=None)
+                if profile_dir and torch.distributed.get_rank() == 0:
+                    from verl.utils.profiler.actor_micro_profile import capture
+
+                    self._actor_microbatch_profiled = True
+                    micro_profile = capture(profile_dir, micro_batch.shape[0])
+            with micro_profile, ctx, sync_ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
                 loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
 
                 if not forward_only:
@@ -1037,13 +1045,19 @@ class FSDPEngine(BaseEngine):
             per_tensor_param = params.items()
         else:
             device = get_device_id()  # used when fsdp2 set cpu_offload_policy
-            per_tensor_param = (
-                (
-                    name,
-                    param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param,
+            if (os.environ.get("STEP5_STREAM_EXPERT_WEIGHTS") == "1"
+                    and self.model_config.hf_config.model_type == "step5_vl" and not _is_peft):
+                from verl.models.fsdp_turbo.step5_stream_weights import export_weights
+
+                per_tensor_param = export_weights(params, device)
+            else:
+                per_tensor_param = (
+                    (
+                        name,
+                        param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param,
+                    )
+                    for name, param in params.items()
                 )
-                for name, param in params.items()
-            )
             per_tensor_param = unfuse_moe_params(per_tensor_param, self.model_config.hf_config.model_type)
 
         if self._qat_enabled:

@@ -237,7 +237,8 @@ def offload_fsdp_optimizer(optimizer):
             state = optimizer.state[param]
             for key, value in state.items():
                 if isinstance(value, torch.Tensor):
-                    state[key] = value.to("cpu", non_blocking=True)
+                    # NPU async D2H pins the entire Adam state in host memory.
+                    state[key] = value.to("cpu", non_blocking=value.device.type != "npu")
 
 
 @torch.no_grad()
@@ -249,7 +250,7 @@ def load_fsdp_optimizer(optimizer, device_id):
             state = optimizer.state[param]
             for key, value in state.items():
                 if isinstance(value, torch.Tensor):
-                    state[key] = value.to(device_id, non_blocking=True)
+                    state[key] = value.to(device_id, non_blocking=get_device_name() != "npu")
 
 
 @contextmanager

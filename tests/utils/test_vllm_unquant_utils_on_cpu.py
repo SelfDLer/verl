@@ -121,6 +121,9 @@ def vllm(monkeypatch):
     layerwise = types.ModuleType(_LAYERWISE_MODULE)
     layerwise.LAYERWISE_INFO = weakref.WeakKeyDictionary()
 
+    platforms = types.ModuleType("vllm.platforms")
+    platforms.current_platform = types.SimpleNamespace(device_type="cpu")
+    monkeypatch.setitem(sys.modules, "vllm.platforms", platforms)
     monkeypatch.setitem(sys.modules, _FUSED_MOE_PKG, fused_moe)
     monkeypatch.setitem(sys.modules, _UNQUANTIZED_MODULE, unquantized)
     monkeypatch.setitem(sys.modules, _LAYERWISE_MODULE, layerwise)
@@ -203,6 +206,30 @@ def test_block_layout_is_staged_as_a_view_and_folded_back_into_the_same_storage(
     for name, param in live.items():
         assert getattr(layer, name) is param, "the live parameter object must be back on the layer"
         assert torch.equal(param.data, _block_layout(weights[name]))
+
+
+def test_ascend_receiver_folds_through_its_own_import(vllm, monkeypatch):
+    sys.modules["vllm.platforms"].current_platform.device_type = "npu"
+    ascend = types.ModuleType("vllm_ascend.ops.fused_moe")
+    routed = types.ModuleType("routed_experts")
+    routed.replace_parameter = _replace_parameter
+    ascend.routed_experts = routed
+    monkeypatch.setitem(sys.modules, ascend.__name__, ascend)
+    # The default sender does not set the optional streaming flag.
+    monkeypatch.delenv("STEP5_STREAM_EXPERT_WEIGHTS", raising=False)
+    layer = _FakeRoutedExperts(vllm.unquantized.UnquantizedFusedMoEMethod())
+    model = _engine_init(vllm, [layer])
+    live = layer.w13_weight
+    staged = unquant_utils.stage_unquantized_moe_params(model)
+    weights = _new_weights(seed=7)
+    _load(layer, weights)
+    with unquant_utils.fold_unquantized_moe_params(staged):
+        for name, new in weights.items():
+            routed.replace_parameter(layer, name, _block_layout(new))
+        assert layer.w13_weight is live
+        assert torch.equal(live, _block_layout(weights["w13_weight"]))
+        assert not getattr(layer, unquant_utils._LIVE_ATTR)
+    assert routed.replace_parameter is _replace_parameter
 
 
 def test_each_layer_is_folded_before_the_next_is_processed(vllm):

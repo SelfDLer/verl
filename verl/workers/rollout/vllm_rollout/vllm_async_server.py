@@ -1455,22 +1455,23 @@ class vLLMHttpServer:
         return ["kv_cache", "weights"]
 
     def _resolve_sleep_level(self) -> int:
-        """Deepest sleep level whose discarded state a subsequent weight sync can restore.
-
-        MTP drafter-only weights are initialized by vLLM and are not guaranteed
-        to be restored by actor weight sync after level 2 sleep discards them.
-        lora only update adapter weights, so set sleep level to 1.
-        vllm_ascend not support sleep_level now. Enabling EP during training may lead to accuracy issues.
-        """
+        """Select the sleep level used before the next weight sync."""
+        requested = getattr(self.config, "vllm_sleep_level", None)
         mtp_config = getattr(self.config, "mtp", None)
         mtp_rollout_enabled = (
             mtp_config is not None
             and getattr(mtp_config, "enable", False)
             and getattr(mtp_config, "enable_rollout", False)
         )
-        if mtp_rollout_enabled or self.lora_as_adapter or is_torch_npu_available(check_device=False):
+        if mtp_rollout_enabled or self.lora_as_adapter:
+            if requested == 2:
+                raise ValueError(
+                    "vLLM sleep level 2 needs a full weight sync. MTP rollout and adapter-only LoRA require level 1."
+                )
             return 1
-        return 2
+        if requested is not None:
+            return requested
+        return 1 if is_torch_npu_available(check_device=False) else 2
 
     def _preprocess_sampling_params(self, sampling_params: dict[str, Any]) -> None:
         """Mutate a request's sampling_params in-place after defaults are filled.
@@ -1490,7 +1491,7 @@ class vLLMHttpServer:
         return output
 
     async def _sleep_hybrid(self):
-        """HYBRID sleep: adapters and MTP need level=1; full weights need level=2.
+        """Sleep the hybrid engine before its next weight sync.
 
         Uses engine.sleep() instead of engine.collective_rpc("sleep") to ensure
         that sleep is properly propagated to all data-parallel worker processes.
@@ -1558,6 +1559,8 @@ class vLLMReplica(RolloutReplica):
                 **{var: "1" for var in get_platform().ray_noset_envvars()},
                 **get_platform().rollout_env_vars(),
             }
+            if rollout_hccl := os.environ.get("STEP5_ROLLOUT_HCCL_MODE"):
+                env_vars["HCCL_OP_EXPANSION_MODE"] = rollout_hccl
 
             server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(

@@ -1859,6 +1859,9 @@ class PPOTrainer(ABC):
             "dataloader_kwargs": {"shuffle": self.config.actor_rollout_ref.actor.shuffle},
             "temperature": self.config.actor_rollout_ref.rollout.temperature,
         }
+        profile_dir = self.config.trainer.get("actor_microbatch_profile_dir")
+        if self.global_steps == 3 and profile_dir:
+            extra_info["actor_microbatch_profile_dir"] = profile_dir
         batch.extra_info.update(extra_info)
 
         output: TensorDict = self.actor_rollout_wg.update_actor(batch)

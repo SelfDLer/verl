@@ -275,6 +275,7 @@ class RolloutConfig(BaseConfig):
     moe_load_balance_metrics_interval: int = 0
 
     enable_sleep_mode: bool = True
+    vllm_sleep_level: Optional[int] = None
 
     mtp: MtpConfig = field(default_factory=MtpConfig)
 
@@ -286,6 +287,8 @@ class RolloutConfig(BaseConfig):
 
     def __post_init__(self):
         """Validate the rollout config"""
+        if self.vllm_sleep_level is not None and self.vllm_sleep_level not in (1, 2):
+            raise ValueError("vllm_sleep_level must be 1, 2, or null (automatic)")
         # Deprecation warning for mode field - only async mode is supported
         if self.mode == "sync":
             raise ValueError(

@@ -63,6 +63,9 @@ cudagraph_capture_sizes: null
 # Whether to free engine KVCache after generation.
 free_cache_engine: True
 
+# vLLM sleep before a weight sync: null keeps the platform default, 1 offloads, 2 discards weights.
+vllm_sleep_level: null
+
 # TP size for rollout. Not effective for hf
 tensor_model_parallel_size: 2
 

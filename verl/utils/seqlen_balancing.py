@@ -24,6 +24,31 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_name
 
 
+_count_groups = {}
+
+
+def _count_collective(dp_group):
+    """Use a host process group for micro-batch scheduling metadata on Ascend."""
+    if get_device_name() != "npu":
+        return dp_group, get_device_name()
+    if dp_group not in _count_groups:
+        backend = str(dist.get_backend_config(dp_group))
+        if "cpu:gloo" in backend or dist.get_backend(dp_group) == "gloo":
+            count_group = dp_group
+        else:
+            count_group = dist.new_group(
+                ranks=dist.get_process_group_ranks(dp_group), backend="gloo",
+                use_local_synchronization=True,
+            )
+        _count_groups[dp_group] = count_group
+        if dist.get_rank(dp_group) == 0:
+            import resource
+            soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+            print(f"[micro-batch] Gloo scheduling for {dist.get_world_size(dp_group)} ranks "
+                  f"(backend={backend}, reused={count_group is dp_group}, fd_limit={soft})", flush=True)
+    return _count_groups[dp_group], "cpu"
+
+
 def calculate_workload(seqlen_list: torch.Tensor) -> torch.Tensor:
     """Calculate approximate computational workload for transformer attention.
 
@@ -401,8 +426,9 @@ def rearrange_micro_batches(
         num_micro_batches = max(min_num_micro_batch, num_micro_batches)
     sync_micro_batch_count = dist.is_initialized() and same_micro_num_in_dp and dp_group is not None
     if sync_micro_batch_count:
-        num_micro_batches = torch.tensor([num_micro_batches], device=get_device_name())
-        dist.all_reduce(num_micro_batches, op=dist.ReduceOp.MAX, group=dp_group)
+        count_group, count_device = _count_collective(dp_group)
+        num_micro_batches = torch.tensor([num_micro_batches], device=count_device)
+        dist.all_reduce(num_micro_batches, op=dist.ReduceOp.MAX, group=count_group)
         num_micro_batches = num_micro_batches.cpu().item()
     if num_batches_divided_by is not None:
         num_micro_batches = roundup_divisible(num_micro_batches, num_batches_divided_by)
@@ -427,8 +453,8 @@ def rearrange_micro_batches(
     min_num_groups = num_groups
     if sync_micro_batch_count:
         # Fatal constraints must be agreed on before any rank raises; otherwise peers can hang in the next collective.
-        constraints = torch.tensor([max_group_token_len, -num_groups], dtype=torch.long, device=get_device_name())
-        dist.all_reduce(constraints, op=dist.ReduceOp.MAX, group=dp_group)
+        constraints = torch.tensor([max_group_token_len, -num_groups], dtype=torch.long, device=count_device)
+        dist.all_reduce(constraints, op=dist.ReduceOp.MAX, group=count_group)
         max_group_token_len = int(constraints[0].item())
         min_num_groups = -int(constraints[1].item())
 
@@ -454,8 +480,8 @@ def rearrange_micro_batches(
             sum(group_token_lens[idx] for idx in partition) <= max_token_len for partition in micro_bsz_group_idx
         )
         if sync_micro_batch_count:
-            within_limit_tensor = torch.tensor([int(within_limit)], device=get_device_name())
-            dist.all_reduce(within_limit_tensor, op=dist.ReduceOp.MIN, group=dp_group)
+            within_limit_tensor = torch.tensor([int(within_limit)], device=count_device)
+            dist.all_reduce(within_limit_tensor, op=dist.ReduceOp.MIN, group=count_group)
             within_limit = bool(within_limit_tensor.item())
         if within_limit:
             break
