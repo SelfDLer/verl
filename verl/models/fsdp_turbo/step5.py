@@ -20,6 +20,8 @@ from pathlib import Path
 
 import torch
 
+from verl.utils.torch_dtypes import PrecisionType
+
 from . import ModelAdapter
 
 logger = logging.getLogger(__name__)
@@ -29,15 +31,21 @@ logger = logging.getLogger(__name__)
 def restore_fp32_checkpoint_tensors(module, checkpoint_path):
     """Preserve checkpoint values for the model's FP32 parameters and buffers.
 
-    The upstream dtype conversion casts all tensors to BF16 before restoring
+    The low-precision conversion casts floating tensors before restoring
     FP32 storage for norms, routing bias and indexer tensors. Widening that
     rounded value cannot recover the checkpoint's precision. Reload only these
-    small tensors after conversion, leaving the large matmul weights in BF16.
+    small tensors after conversion, keeping the requested dtype for matmuls.
     """
     from safetensors import safe_open
 
     root = Path(checkpoint_path)
-    weight_map = json.loads((root / "model.safetensors.index.json").read_text())["weight_map"]
+    index = root / "model.safetensors.index.json"
+    if index.is_file():
+        weight_map = json.loads(index.read_text())["weight_map"]
+    else:
+        shard = "model.safetensors"
+        with safe_open(str(root / shard), framework="pt", device="cpu") as source:
+            weight_map = dict.fromkeys(source.keys(), shard)
     by_shard = defaultdict(list)
     for name, tensor in module.state_dict().items():
         if tensor.dtype == torch.float32 and name in weight_map:
@@ -110,11 +118,16 @@ class Step5ModelAdapter(ModelAdapter):
 
         config = engine.model_config.hf_config
         configure_step5_checkpoint_expert_layout(config, engine.model_config.local_path)
+        model_dtype = engine.engine_config.model_dtype
+        if model_dtype is None:
+            model_dtype = torch.bfloat16 if engine.engine_config.forward_only else torch.float32
+        model_dtype = PrecisionType.to_dtype(model_dtype)
         module = Step5ForConditionalGeneration.from_pretrained(
-            engine.model_config.local_path, config=config, dtype=torch.bfloat16, trust_remote_code=False
+            engine.model_config.local_path, config=config, dtype=model_dtype, trust_remote_code=False
         )
-        convert_step5_model_dtype(module, torch.bfloat16)
-        restore_fp32_checkpoint_tensors(module, engine.model_config.local_path)
+        if model_dtype != torch.float32:
+            convert_step5_model_dtype(module, model_dtype)
+            restore_fp32_checkpoint_tensors(module, engine.model_config.local_path)
         align_step5_vision_calls(module)
         configure_step5_vision_freezing(module, config)
         return module
