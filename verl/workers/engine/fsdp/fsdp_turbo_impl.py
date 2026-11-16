@@ -76,6 +76,7 @@ class FSDPTurboEngineWithLMHead(FSDPEngineWithLMHead):
             self._model_adapter.prepare_fsdp(self, module)
             full_state = module.state_dict() if torch.distributed.get_rank() == 0 else {}
         module = FSDPTurbo(self.fsdp_turbo_config, module).model
+        self._model_adapter.prepare_sharded_storage(module)
         if rank0_experts:
             allocate_rank0_expert_shards(module)
         offload_policy = None

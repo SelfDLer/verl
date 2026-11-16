@@ -993,7 +993,7 @@ class FSDPEngine(BaseEngine):
         gen, _ = self.get_per_tensor_param_shard()
         return hf_delta_export(gen, self._delta_shard_snap, self._hf_delta_entry), None
 
-    def get_per_tensor_param(self, layered_summon=False, base_sync_done=False, **kwargs):
+    def get_per_tensor_param(self, layered_summon=False, base_sync_done=False, rollout_dtype=None, **kwargs):
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
 
         # FSDP2 CPUOffloadPolicy owns CPU<->GPU placement; calling model.to(device) here
@@ -1050,6 +1050,16 @@ class FSDPEngine(BaseEngine):
                 from verl.models.fsdp_turbo.step5_stream_weights import export_weights
 
                 per_tensor_param = export_weights(params, device)
+            elif (
+                self.model_config.hf_config.model_type == "step5_vl"
+                and not _is_peft
+                and not self._qat_enabled
+                and not getattr(self.model_config.hf_config, "quantization_config", None)
+                and rollout_dtype in ("bf16", "bfloat16", torch.bfloat16)
+            ):
+                from verl.models.fsdp_turbo.step5 import gather_bf16_rollout_weights
+
+                per_tensor_param = gather_bf16_rollout_weights(params, device)
             else:
                 per_tensor_param = (
                     (

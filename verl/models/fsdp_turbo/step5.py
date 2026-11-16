@@ -59,6 +59,30 @@ def restore_fp32_checkpoint_tensors(module, checkpoint_path):
                 tensor.copy_(value)
 
 
+def gather_bf16_rollout_weights(params, device):
+    """Gather routed expert matrices in their rollout storage dtype."""
+    from torch.distributed.tensor import DTensor
+
+    expert_projections = (
+        ".moe.experts.gate_up_proj",
+        ".moe.experts.gate_proj",
+        ".moe.experts.up_proj",
+        ".moe.experts.down_proj",
+    )
+    for name, param in params.items():
+        if (
+            name.removesuffix(".weight").endswith(expert_projections)
+            and param.dtype == torch.float32
+            and (not isinstance(param, DTensor) or not any(p.is_partial() for p in param.placements))
+        ):
+            # This casts only the local shard (including CPU-offloaded shards).
+            # The actor's master parameter remains untouched.
+            param = param.to(dtype=torch.bfloat16)
+        if isinstance(param, DTensor):
+            param = param.to(device, non_blocking=True).full_tensor()
+        yield name, param
+
+
 def configure_step5_vision_freezing(module, config):
     """Apply independent vision/projector freeze flags before FSDP and optimizer setup.
 
@@ -122,8 +146,19 @@ class Step5ModelAdapter(ModelAdapter):
         if model_dtype is None:
             model_dtype = torch.bfloat16 if engine.engine_config.forward_only else torch.float32
         model_dtype = PrecisionType.to_dtype(model_dtype)
+        self._sharded_fp32_master = (
+            model_dtype == torch.float32
+            and distributed.fsdp_plan.fsdp_implementation == "native"
+            and not engine.engine_config.forward_only
+            and not getattr(engine, "_is_lora", False)
+            and not getattr(engine, "_qat_enabled", False)
+        )
         module = Step5ForConditionalGeneration.from_pretrained(
-            engine.model_config.local_path, config=config, dtype=model_dtype, trust_remote_code=False
+            engine.model_config.local_path,
+            config=config,
+            dtype=model_dtype,
+            trust_remote_code=False,
+            load_checkpoint_in_native_dtype=self._sharded_fp32_master,
         )
         if model_dtype != torch.float32:
             convert_step5_model_dtype(module, model_dtype)
@@ -203,6 +238,12 @@ class Step5ModelAdapter(ModelAdapter):
                 if plan is not None:
                     plan.apply_modules = [prefixed(name) for name in (plan.apply_modules or [])]
             engine.fsdp_turbo_config = config
+
+    def prepare_sharded_storage(self, module):
+        if self._sharded_fp32_master:
+            # FSDP2 Module._apply updates its owned shard storage. Rank zero's
+            # separate full_state still points at the original checkpoint tensors.
+            module.float()
 
     def export_weights(self, weights):
         from verl.models.transformers.step5 import step5_hf_weight_name

@@ -34,6 +34,10 @@ class ModelAdapter:
         """Apply model-specific preparation before sharding, when needed."""
         pass
 
+    def prepare_sharded_storage(self, module):
+        """Set the local shard dtype before checkpoint broadcast and optimizer setup."""
+        pass
+
     def export_weights(self, weights):
         """Preserve the original lazy checkpoint iterator."""
         return weights

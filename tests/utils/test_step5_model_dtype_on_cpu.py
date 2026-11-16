@@ -23,7 +23,7 @@ pytest.importorskip("fsdp_turbo")
 from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig
 from fsdp_turbo.models.step5 import Step5ForConditionalGeneration, Step5VLConfig
 
-from verl.models.fsdp_turbo.step5 import Step5ModelAdapter
+from verl.models.fsdp_turbo.step5 import Step5ModelAdapter, gather_bf16_rollout_weights
 from verl.workers.config.optimizer import FSDPOptimizerConfig, build_optimizer
 
 
@@ -64,7 +64,8 @@ def checkpoint(tmp_path_factory, request):
         for tensor in (layer.input_layernorm.weight, layer.moe.router_bias):
             tensor.fill_(0.02001234)
     model.save_pretrained(path, max_shard_size="4KB" if request.param == "sharded" else "1GB")
-    return path, layer.self_attn.q_proj.weight.flatten()[0].item()
+    matrix = layer.self_attn.q_proj.weight
+    return path, matrix.flatten()[0].item(), matrix.dtype
 
 
 @pytest.mark.parametrize(
@@ -77,7 +78,7 @@ def checkpoint(tmp_path_factory, request):
     ],
 )
 def test_step5_master_dtype(checkpoint, model_dtype, forward_only, expected):
-    path, matrix_value = checkpoint
+    path, matrix_value, source_dtype = checkpoint
     config = Step5VLConfig.from_pretrained(path)
     engine = SimpleNamespace(
         engine_config=SimpleNamespace(
@@ -95,7 +96,12 @@ def test_step5_master_dtype(checkpoint, model_dtype, forward_only, expected):
         assert tensor.dtype == torch.float32
         assert torch.equal(tensor, torch.full_like(tensor, 0.02001234))
 
+    if expected == torch.float32 and not forward_only:
+        assert layer.self_attn.q_proj.weight.dtype == source_dtype
+        assert layer.moe.down_proj.weight.dtype == source_dtype
+
     adapter.prepare_fsdp(engine, model)
+    adapter.prepare_sharded_storage(model)
     weights = [layer.self_attn.q_proj.weight, layer.moe.experts.down_proj]
     for weight in weights:
         assert weight.dtype == expected
@@ -113,3 +119,31 @@ def test_step5_master_dtype(checkpoint, model_dtype, forward_only, expected):
             assert optimizer.state[weight]["exp_avg"].dtype == expected
             assert optimizer.state[weight]["exp_avg_sq"].dtype == expected
             assert torch.equal(weight, original) == (expected == torch.bfloat16)
+
+
+def test_step5_rollout_gather_dtype(tmp_path, monkeypatch):
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Shard
+
+    dist.init_process_group("gloo", init_method=(tmp_path / "rdzv").as_uri(), rank=0, world_size=1)
+    try:
+        mesh = init_device_mesh("cpu", (1,))
+        master = DTensor.from_local(torch.full((2, 4, 8), 0.02001234), mesh, [Shard(0)])
+        original = master.to_local().clone()
+        gather = DTensor.full_tensor
+        gather_dtypes = []
+
+        def record(tensor, *args, **kwargs):
+            gather_dtypes.append(tensor.to_local().dtype)
+            return gather(tensor, *args, **kwargs)
+
+        monkeypatch.setattr(DTensor, "full_tensor", record)
+        params = {"layer.moe.experts.gate_up_proj": master, "layer.moe.gate.weight": master}
+        expert, router = dict(gather_bf16_rollout_weights(params, "cpu")).values()
+        assert gather_dtypes == [torch.bfloat16, torch.float32]
+        torch.testing.assert_close(expert, original.bfloat16(), rtol=0, atol=0)
+        torch.testing.assert_close(router, original, rtol=0, atol=0)
+        torch.testing.assert_close(master.to_local(), original, rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()

@@ -858,8 +858,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         log_gpu_memory_usage("After resume weights", logger=logger)
 
         # 2. determine if we need a base weight sync (adapter path only)
+        export_options = {}
+        if self.config.actor.strategy == "fsdp_turbo" and self.config.rollout.name == "vllm":
+            rollout = self.config.rollout
+            vllm_kwargs = rollout.engine_kwargs.get("vllm", {})
+            if not rollout.quantization and not vllm_kwargs.get("quantization"):
+                export_options["rollout_dtype"] = vllm_kwargs.get("dtype") or rollout.dtype
         per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
-            layered_summon=self.layered_summon, base_sync_done=True
+            layered_summon=self.layered_summon, base_sync_done=True, **export_options
         )
 
         do_lora_base_sync = False
