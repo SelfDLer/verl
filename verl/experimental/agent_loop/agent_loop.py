@@ -996,29 +996,33 @@ class AgentLoopWorker:
         images = multi_modal_data.get("images")
         videos = multi_modal_data.get("videos")
         audios = multi_modal_data.get("audios")
-        # Collapse expanded vision placeholder runs back to a single placeholder
-        # per media item before decoding, so the processor re-expands cleanly.
-        # ``input_ids`` already contains fully expanded image/video pad tokens; if
-        # those placeholders are NOT registered as special tokens (e.g. Kimi-VL
-        # ``<|media_pad|>``, GLM-4.6V ``<|image|>``), ``skip_special_tokens=True``
-        # will not strip them, and re-feeding the already-expanded text to the
-        # processor triggers a double-expansion error. Collapsing at the token-id
-        # level (using the processor-resolved placeholder ids) is model-agnostic
-        # and leaves the well-behaved (special-token) placeholders untouched.
-        image_token_id = get_processor_token_id(self.processor, "image")
-        video_token_id = get_processor_token_id(self.processor, "video")
-        collapse_ids = {t for t in (image_token_id, video_token_id) if t is not None}
-        collapsed_ids, prev_id = [], None
-        for token_id in input_ids.squeeze(0).tolist():
-            if token_id in collapse_ids and token_id == prev_id:
-                continue
-            collapsed_ids.append(token_id)
-            prev_id = token_id
-        current_text = self.tokenizer.decode(collapsed_ids, skip_special_tokens=True)
+        # Step5 image delimiters disappear in decoded text. Its processor can
+        # produce the actor's visual tensors directly from the original images.
+        text = None
+        if self.processor.__class__.__name__ != "Step5Processor":
+            # Collapse expanded vision placeholder runs back to a single placeholder
+            # per media item before decoding, so the processor re-expands cleanly.
+            # ``input_ids`` already contains fully expanded image/video pad tokens; if
+            # those placeholders are NOT registered as special tokens (e.g. Kimi-VL
+            # ``<|media_pad|>``, GLM-4.6V ``<|image|>``), ``skip_special_tokens=True``
+            # will not strip them, and re-feeding the already-expanded text to the
+            # processor triggers a double-expansion error. Collapsing at the token-id
+            # level (using the processor-resolved placeholder ids) is model-agnostic
+            # and leaves the well-behaved (special-token) placeholders untouched.
+            image_token_id = get_processor_token_id(self.processor, "image")
+            video_token_id = get_processor_token_id(self.processor, "video")
+            collapse_ids = {t for t in (image_token_id, video_token_id) if t is not None}
+            collapsed_ids, prev_id = [], None
+            for token_id in input_ids.squeeze(0).tolist():
+                if token_id in collapse_ids and token_id == prev_id:
+                    continue
+                collapsed_ids.append(token_id)
+                prev_id = token_id
+            text = [self.tokenizer.decode(collapsed_ids, skip_special_tokens=True)]
 
         multi_modal_inputs = build_multimodal_processor_inputs(
             self.processor,
-            text=[current_text],
+            text=text,
             images=images,
             videos=videos,
             audio=audios,

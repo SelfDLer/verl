@@ -21,11 +21,13 @@ import time
 import uuid
 import zlib
 from collections.abc import Mapping
+from pkgutil import resolve_name
 from pprint import pprint
 from typing import Any, Callable, Optional
 
 import ray
 import vllm.entrypoints.cli.serve
+from omegaconf import DictConfig
 from packaging import version
 from ray.actor import ActorHandle
 from vllm import SamplingParams
@@ -689,7 +691,13 @@ class vLLMHttpServer:
         budget_warnings = getattr(self, "_topk_budget_warnings", set())
         warn_topk_logprob_budget(sampling_params, budget_warnings)
         self._topk_budget_warnings = budget_warnings
-        prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
+        processor = self.model_config.processor
+        prepare_prompt_ids = getattr(processor, "prepare_rollout_prompt_ids", None)
+        if (image_data or video_data or audio_data) and callable(prepare_prompt_ids):
+            # The context budget above uses the expanded prompt; vLLM expands the media again on submission.
+            prompt_ids = prepare_prompt_ids(prompt_ids)
+        else:
+            prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, processor)
         multi_modal_data = {}
         if image_data is not None:
             multi_modal_data["image"] = image_data
@@ -1372,8 +1380,18 @@ class vLLMHttpServer:
         return omega_conf_to_dataclass(config)
 
     def _init_model_config(self, model_config):
-        """Initialise model_config. Override when a specific dataclass_type is needed."""
-        return omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
+        """Build the requested HFModelConfig class with its typed nested defaults."""
+        target = model_config.get("_target_") if isinstance(model_config, dict | DictConfig) else None
+        config_type = HFModelConfig
+        if isinstance(target, str) and target:
+            # Recipes may use a factory or a target available only on the driver.
+            try:
+                target_type = resolve_name(target)
+            except (ImportError, AttributeError, ValueError):
+                target_type = None
+            if isinstance(target_type, type) and issubclass(target_type, HFModelConfig):
+                config_type = target_type
+        return omega_conf_to_dataclass(model_config, dataclass_type=config_type)
 
     def _validate_configs(self) -> None:
         """Validate config/model_config after initialisation."""

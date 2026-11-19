@@ -226,8 +226,8 @@ def hf_processor(name_or_path, **kwargs):
                 from transformers.models.glm46v import Glm46VModel
 
                 model_class = Glm46VModel
-            case "MllamaProcessor":
-                pass  # MllamaProcessor and MllamaModel doesn't have get_rope_index property
+            case "MllamaProcessor" | "Step5Processor":
+                pass  # These models use standard 1D positions.
             case "Gemma4Processor":
                 # Gemma4 uses standard 1D RoPE -> no get_rope_index to bind. Disable its strict
                 # per-image-token check (which Qwen's processor lacks).

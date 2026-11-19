@@ -28,6 +28,7 @@ _preprocess_sampling_params before admission, _postprocess_output after release.
 """
 
 import asyncio
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -35,9 +36,11 @@ import pytest
 pytest.importorskip("ray")
 pytest.importorskip("vllm")
 
+from omegaconf import OmegaConf
 from vllm.logprobs import Logprob
 
-from verl.workers.config import RolloutConfig
+from verl.utils.config import omega_conf_to_dataclass
+from verl.workers.config import HFModelConfig, MtpConfig, RolloutConfig
 from verl.workers.rollout.vllm_rollout import vllm_async_server
 
 
@@ -56,11 +59,13 @@ class _FakeEngine:
         self.reset_prefix_calls = 0
         self.outputs = []
         self.sampling_params = []
+        self.prompts = []
         self.closed = 0
 
     async def add_request(self, request_id, prompt, params, lora_request=None, priority=0, data_parallel_rank=None):
         """Like AsyncLLM.add_request(): returns a collector that yields ``outputs``, the last one finished."""
         self.sampling_params.append(params)
+        self.prompts.append(prompt)
         pending = list(self.outputs)
         for i, output in enumerate(pending):
             output.finished = i == len(pending) - 1
@@ -361,6 +366,91 @@ def _request_output(token_ids, rows=None, *, finish_reason="stop"):
         token_ids=token_ids, logprobs=rows, finish_reason=finish_reason, routed_experts=None, num_preempted=0
     )
     return SimpleNamespace(outputs=[completion], num_cached_tokens=0, prompt_logprobs=None)
+
+
+@dataclass
+class _CustomHFModelConfig(HFModelConfig):
+    extra_option: int = 0
+
+
+@pytest.mark.parametrize(
+    ("target", "expected_class"),
+    [
+        (None, HFModelConfig),
+        ("verl.workers.config.HFModelConfig", HFModelConfig),
+        ("verl.workers.config.model.HFModelConfig", HFModelConfig),
+        (f"{__name__}._CustomHFModelConfig", _CustomHFModelConfig),
+        ("verl.workers.config.MtpConfig", HFModelConfig),
+        (f"{__name__}.MissingConfig", HFModelConfig),
+        ("missing_driver_recipe.config_factory", HFModelConfig),
+    ],
+)
+def test_init_model_config_keeps_typed_fields(monkeypatch, target, expected_class):
+    monkeypatch.setattr(HFModelConfig, "__post_init__", lambda self: None)
+    config = OmegaConf.create({"path": "test-model", "mtp": {"enable": True}})
+    if target:
+        config._target_ = target
+    if expected_class is _CustomHFModelConfig:
+        config.extra_option = 7
+
+    server = _make_server()
+    result = server._init_model_config(config)
+    assert type(result) is expected_class
+    assert isinstance(result.mtp, MtpConfig)
+    assert result.mtp.enable
+    if expected_class is _CustomHFModelConfig:
+        assert result.extra_option == 7
+    assert server._init_model_config(result) is result
+
+
+def test_init_model_config_keeps_driver_factory_on_driver(monkeypatch):
+    # The driver instantiates the recipe target. Each server loads the checkpoint locally.
+    calls = []
+
+    def factory(path):
+        calls.append(path)
+        return HFModelConfig(path=path)
+
+    monkeypatch.setattr(HFModelConfig, "__post_init__", lambda self: None)
+    monkeypatch.setattr(f"{__name__}.model_factory", factory, raising=False)
+    config = OmegaConf.create({"_target_": f"{__name__}.model_factory", "path": "test-model"})
+    driver = omega_conf_to_dataclass(config)
+    server = _make_server()._init_model_config(config)
+    assert type(server) is HFModelConfig and isinstance(server.mtp, MtpConfig)
+    assert server.path == driver.path == "test-model"
+    assert calls == ["test-model"]
+
+
+def test_generate_compacts_only_image_requests_after_budgeting(monkeypatch):
+    server = _make_generating_server(monkeypatch, vllm_async_server.vLLMHttpServer, [_request_output([9])])
+    expanded = [17] * 60
+    images = [object()]
+
+    def prepare(ids):
+        assert ids == expanded
+        return [17]
+
+    server.model_config.processor = SimpleNamespace(prepare_rollout_prompt_ids=prepare)
+    asyncio.run(server.generate(expanded, {"max_tokens": 16}, "image", image_data=images))
+    assert server.engine.prompts[-1]["prompt_token_ids"] == [17]
+    assert server.engine.prompts[-1]["multi_modal_data"]["image"] == images
+    assert server.engine.sampling_params[-1].max_tokens == 4
+
+    literals = [17, 17]
+    asyncio.run(server.generate(literals, {}, "text"))
+    assert server.engine.prompts[-1]["prompt_token_ids"] == literals
+
+
+def test_generate_retains_qwen_placeholder_deduplication(monkeypatch):
+    class Qwen2VLImageProcessor:
+        pass
+
+    server = _make_generating_server(monkeypatch, vllm_async_server.vLLMHttpServer, [_request_output([9])])
+    server.model_config.processor = SimpleNamespace(
+        image_processor=Qwen2VLImageProcessor(), image_token_id=17, video_token_id=18
+    )
+    asyncio.run(server.generate([11, 17, 17, 12], {}, "image", image_data=[object()]))
+    assert server.engine.prompts[-1]["prompt_token_ids"] == [11, 17, 12]
 
 
 @pytest.mark.parametrize(("finish_reason", "stop_reason"), [("stop", "completed"), ("length", "length")])
