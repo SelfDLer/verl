@@ -32,7 +32,8 @@ class FSDPTurboEngineWithLMHead(FSDPEngineWithLMHead):
         from fsdp_turbo.utils.device import set_accelerator_compatible
 
         set_accelerator_compatible()
-        self.fsdp_turbo_config = _dict_to_dataclass(FSDPTurboConfig, self.engine_config.turbo_config)
+        config_class = getattr(self.model_config, "fsdp_turbo_config_class", FSDPTurboConfig)
+        self.fsdp_turbo_config = _dict_to_dataclass(config_class, self.engine_config.turbo_config)
         self.fsdp_turbo_config.distributed.fsdp_plan.cpu_offload = (
             self.engine_config.offload_policy or self.engine_config.forward_only
         )
@@ -48,6 +49,13 @@ class FSDPTurboEngineWithLMHead(FSDPEngineWithLMHead):
         import verl.utils.model as verl_model_utils
 
         set_fused_overrides(self.model_config.hf_config, self.fsdp_turbo_config)
+        build_model = getattr(self.model_config, "build_fsdp_turbo_model", None)
+        if build_model is not None:
+            # fsdp2_load_full_state_dict broadcasts the materialized state from global rank zero.
+            return build_model(
+                self.engine_config, self.fsdp_turbo_config.distributed, init_device="cpu" if self.rank == 0 else "meta"
+            )
+
         turbo_model_cls = get_model_by_name(self.fsdp_turbo_config.model.model_name_or_path)
         _orig_get_class = verl_model_utils.get_hf_auto_model_class
         if turbo_model_cls is not None:

@@ -119,6 +119,32 @@ fused kernels:
   ``hf_config`` through ``fsdp_turbo.utils.model.set_fused_overrides`` before
   the module is built.
 
+Step5 multimodal actor log-probabilities
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use an FSDPTurbo installation that provides
+``fsdp_turbo.models.step5.fsdp.build_step5_fsdp_model``. Select the Step5 model
+configuration for an actor that recomputes response log-probabilities from
+text and image inputs:
+
+.. code-block:: bash
+
+   actor_rollout_ref.actor.strategy=fsdp_turbo
+   actor_rollout_ref.model._target_=verl.models.transformers.step5.Step5HFModelConfig
+   actor_rollout_ref.model.use_remove_padding=False
+   actor_rollout_ref.actor.fsdp_config.model_dtype=bf16
+
+The engine validates the sharding plan with the selected model configuration's
+``fsdp_turbo_config_class``, when supplied, and calls its optional
+``build_fsdp_turbo_model(engine_config, distributed_config, *, init_device)``
+before sharding. Step5 loads the checkpoint on rank zero and builds the same
+parameter layout on the meta device on other ranks. The builder preserves
+Step5's FP32 normalization and sparse-indexer parameters during BF16 loading.
+Use standard logits with Ulysses size 1. For batches that mix text, whole
+images and crops across ranks, leave the vision tower and projector in the
+root FSDP unit. Wrapping either one separately would make its all-gathers
+depend on the number of image and crop encoder calls on each rank.
+
 Module patches and CP function patches
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
