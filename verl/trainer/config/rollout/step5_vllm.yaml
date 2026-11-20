@@ -1,0 +1,10 @@
+defaults:
+  - rollout
+  - _self_
+
+name: vllm
+
+checkpoint_engine:
+
+  # Step5's fused QKV and indexer shards can arrive in different buckets.
+  skip_bucket_completeness_check: true

@@ -87,6 +87,13 @@ class FSDPTurboEngineWithLMHead(FSDPEngineWithLMHead):
 
         return module
 
+    def get_per_tensor_param(self, layered_summon=False, base_sync_done=False, **kwargs):
+        weights, peft_config = super().get_per_tensor_param(layered_summon, base_sync_done, **kwargs)
+        export_weights = getattr(self.model_config, "export_fsdp_turbo_weights", None)
+        if export_weights is not None and (peft_config is None or not base_sync_done):
+            weights = export_weights(weights)
+        return weights, peft_config
+
     def _is_ulysses_enabled(self):
         return self._parallel_state.is_group_enable("ulysses")
 

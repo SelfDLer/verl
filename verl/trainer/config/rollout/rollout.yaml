@@ -316,6 +316,9 @@ checkpoint_engine:
   # in CheckpointEngineRegistry.
   custom_backend_module: null
 
+  # Skip per-load shard validation when vLLM receives base weights in buckets.
+  skip_bucket_completeness_check: false
+
 # trace rollout data
 trace:
 

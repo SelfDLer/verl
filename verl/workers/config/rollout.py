@@ -140,6 +140,8 @@ class CheckpointEngineConfig(BaseConfig):
     # backend is instantiated, allowing custom backends to register themselves
     # in CheckpointEngineRegistry.
     custom_backend_module: Optional[str] = None
+    # Skip per-load shard validation for bucketed vLLM base-weight updates.
+    skip_bucket_completeness_check: bool = False
 
 
 @dataclass

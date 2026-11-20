@@ -147,3 +147,32 @@ def test_fsdp_turbo_keeps_default_loader(monkeypatch, turbo_builder):
     assert engine._build_module() is loaded
     assert engine.ulysses_sequence_parallel_size == 2
     turbo_builder.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "use_step5, peft_config, base_sync_done, convert",
+    [
+        (True, None, True, True),
+        (True, {"r": 4}, False, True),
+        (True, {"r": 4}, True, False),
+        (False, None, False, False),
+    ],
+)
+def test_fsdp_turbo_hf_export(monkeypatch, use_step5, peft_config, base_sync_done, convert):
+    from verl.workers.engine.fsdp import FSDPEngineWithLMHead, FSDPTurboEngineWithLMHead
+
+    key = "model.layers.1.moe.experts.up_proj"
+    tensor = torch.zeros(2, 1, 4)
+    weights = iter([(key, tensor)])
+    parent = Mock(return_value=(weights, peft_config))
+    monkeypatch.setattr(FSDPEngineWithLMHead, "get_per_tensor_param", parent)
+    engine = object.__new__(FSDPTurboEngineWithLMHead)
+    engine.model_config = Step5HFModelConfig if use_step5 else SimpleNamespace()
+    if convert:
+        pytest.importorskip("fsdp_turbo.models.step5.checkpoint_compat")
+    result, config = engine.get_per_tensor_param(layered_summon=True, base_sync_done=base_sync_done)
+    assert config is peft_config
+    parent.assert_called_once_with(True, base_sync_done)
+    name, actual = next(result)
+    assert name == ("model.layers.1.moe.up_proj.weight" if convert else key)
+    assert actual is tensor

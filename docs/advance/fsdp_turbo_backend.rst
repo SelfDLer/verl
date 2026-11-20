@@ -145,6 +145,24 @@ images and crops across ranks, leave the vision tower and projector in the
 root FSDP unit. Wrapping either one separately would make its all-gathers
 depend on the number of image and crop encoder calls on each rank.
 
+For a BF16 Step5 actor and colocated vLLM Ascend rollout, the FSDPTurbo
+engine exports gathered weights under their Hugging Face checkpoint names.
+Select the Step5 rollout recipe alongside the actor options above:
+
+.. code-block:: bash
+
+   rollout@actor_rollout_ref.rollout=step5_vllm
+
+The recipe sets
+``actor_rollout_ref.rollout.checkpoint_engine.skip_bucket_completeness_check=true``.
+The default rollout sets it to ``false``. Step5's fused QKV and indexer shards
+can span transport buckets, and vLLM calls ``load_weights`` once per bucket.
+The option skips the per-load check for bucketed base weights on this rollout
+instance, including the initial base sync for LoRA. A shard missing from
+the entire transfer will go undetected by this check. When shared memory is used,
+size ``actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes``
+to fit the largest exported tensor.
+
 Module patches and CP function patches
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

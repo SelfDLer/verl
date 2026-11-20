@@ -267,7 +267,13 @@ class vLLMColocateWorkerExtension:
             attest_nvfp4_per_token_runtime(model, self._nvfp4_per_token_config)
             clear_kv_cache(model)
 
-    def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
+    def update_weights_from_ipc(
+        self,
+        peft_config: dict = None,
+        base_sync_done=False,
+        use_shm: bool = False,
+        skip_bucket_completeness_check: bool = False,
+    ):
         """Update the weights of the rollout model."""
         if self.device is None:
             # vLLM workers may leave self.device unset on non-CUDA platforms (e.g. NPU);
@@ -321,13 +327,10 @@ class vLLMColocateWorkerExtension:
 
             pin_memory = is_pin_memory_available()
 
-        # A bucket can contain only base-model weights, so skip the drafter's
-        # per-load completeness check during this bucketed transfer, including
-        # the initial base-weight sync for LoRA.
-        skip_mtp_completeness_check = (
-            not (peft_config and base_sync_done)
-            and not is_quantized_model(self.model_runner.vllm_config)
-            and self._use_mtp_drafter_weight_sync()
+        # A base-weight bucket may contain only part of a fused projection or omit drafter weights.
+        skip_mtp_completeness_check = lora_weights is None and (
+            skip_bucket_completeness_check is True
+            or (not is_quantized_model(self.model_runner.vllm_config) and self._use_mtp_drafter_weight_sync())
         )
         mtp_load_context = nullcontext
         if skip_mtp_completeness_check:

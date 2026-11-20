@@ -226,6 +226,8 @@ class ServerAdapter(BaseRollout):
         )
         start_time = time.time()
 
+        if self.config.checkpoint_engine.skip_bucket_completeness_check is True:
+            kwargs["skip_bucket_completeness_check"] = True
         future = await self._execute_method(
             "update_weights_from_ipc",
             non_block=True,

@@ -351,6 +351,7 @@ actor_rollout_ref:
       update_weights_bucket_megabytes: 2048
       engine_kwargs: {}
       custom_backend_module: null
+      skip_bucket_completeness_check: false
     trace:
       _target_: verl.workers.config.TraceConfig
       project_name: ${oc.select:trainer.project_name,null}

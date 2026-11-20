@@ -22,8 +22,10 @@ from verl.utils.torch_dtypes import PrecisionType
 from verl.workers.config import FSDPEngineConfig, HFModelConfig
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable, Iterator
+
     from fsdp_turbo.fsdp_turbo_config import DistributedConfig, FSDPTurboConfig
-    from torch import nn
+    from torch import Tensor, nn
 
 
 class Step5HFModelConfig(HFModelConfig):
@@ -81,3 +83,10 @@ class Step5HFModelConfig(HFModelConfig):
         if self.enable_gradient_checkpointing:
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         return model
+
+    @staticmethod
+    def export_fsdp_turbo_weights(weights: Iterable[tuple[str, Tensor]]) -> Iterator[tuple[str, Tensor]]:
+        """Restore Hugging Face checkpoint names and layouts for rollout weight sync."""
+        from fsdp_turbo.models.step5.checkpoint_compat import iter_step5_hf_weights
+
+        return iter_step5_hf_weights(weights)
