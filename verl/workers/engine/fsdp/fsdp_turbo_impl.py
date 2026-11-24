@@ -14,6 +14,7 @@
 
 import torch
 
+from verl.utils import tensordict_utils as tu
 from verl.utils.fsdp_utils import fsdp2_load_full_state_dict
 
 from ..base import EngineRegistry
@@ -73,6 +74,11 @@ class FSDPTurboEngineWithLMHead(FSDPEngineWithLMHead):
                 verl_model_utils.get_hf_auto_model_class = _orig_get_class
 
     def _build_fsdp_module(self, module):
+        if self.engine_config.router_replay["mode"] == "R3" and not getattr(
+            module, "supports_rollout_router_replay", False
+        ):
+            raise ValueError(f"{type(module).__name__} does not support FSDPTurbo rollout router replay (R3)")
+
         from fsdp_turbo.fsdp_turbo import FSDPTurbo
 
         full_state = module.state_dict()
@@ -86,6 +92,34 @@ class FSDPTurboEngineWithLMHead(FSDPEngineWithLMHead):
         fsdp2_load_full_state_dict(module, full_state, None, offload_policy)
 
         return module
+
+    def prepare_model_inputs(self, micro_batch):
+        model_inputs, output_args = super().prepare_model_inputs(micro_batch)
+        if not tu.get_non_tensor_data(micro_batch, "enable_routing_replay", default=False):
+            return model_inputs, output_args
+        if self.engine_config.router_replay["mode"] != "R3":
+            raise ValueError("FSDPTurbo supports rollout router replay (R3) only")
+        if tu.get_non_tensor_data(micro_batch, "use_remove_padding", default=True) or self.use_ulysses_sp:
+            raise ValueError("FSDPTurbo router replay requires padded inputs without sequence parallelism")
+
+        routes = micro_batch.get("routed_experts")
+        if routes is None:
+            raise ValueError("R3 requires routed_experts from rollout.enable_rollout_routing_replay=True")
+        input_ids = micro_batch["input_ids"]
+        if routes.ndim != 4 or not routes.is_nested or not torch.equal(routes.offsets(), input_ids.offsets()):
+            raise ValueError("R3 requires routed_experts aligned with the absolute input token positions")
+        attention_mask = model_inputs["attention_mask"]
+        # TransferQueue stores compact int16 indices. Ascend masked_fill needs int32.
+        routes = routes.to(torch.int32).to_padded_tensor(-1, output_size=(*attention_mask.shape, *routes.shape[2:]))
+        response_mask = micro_batch["response_mask"]
+        if response_mask.is_nested:
+            response_mask = response_mask.to_padded_tensor(0)
+        # The last input token was never fed back to vLLM. Synthetic padding
+        # samples have no generated tokens and use the model's normal routing.
+        replay_mask = torch.zeros_like(attention_mask, dtype=torch.bool)
+        replay_mask[:, :-1] = attention_mask[:, 1:].bool() & response_mask.any(dim=1, keepdim=True)
+        model_inputs["routed_experts"] = routes.masked_fill_(~replay_mask[:, :, None, None], -1)
+        return model_inputs, output_args
 
     def get_per_tensor_param(self, layered_summon=False, base_sync_done=False, **kwargs):
         weights, peft_config = super().get_per_tensor_param(layered_summon, base_sync_done, **kwargs)

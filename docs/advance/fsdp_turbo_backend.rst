@@ -328,3 +328,19 @@ Source of truth
   exports ``PYTHONPATH``).
 * ``.github/workflows/nightly_ascend.yml``: NPU nightly CI workflow (turbo job
   ``nightlyCI_grpo_qwen3_5_2b_fsdp_turbo_vllm_ascend``, scheduled daily).
+
+Step5 rollout router replay
+---------------------------
+
+For single-turn Step5 rollouts with padded actor inputs and sequence parallel
+size 1, enable R3 to reuse expert selections in actor log-probability computation
+and policy updates. The actor computes its own router weights. With the Ascend
+verified vLLM revision ``ba15685``, enable prefix caching. Its auxiliary
+output connector uses the cached KV blocks to restore expert selections for
+prompt tokens served from the prefix cache.
+
+.. code-block:: bash
+
+   actor_rollout_ref.rollout.enable_rollout_routing_replay=true
+   actor_rollout_ref.rollout.enable_prefix_caching=true
+   +actor_rollout_ref.actor.fsdp_config.router_replay.mode=R3
